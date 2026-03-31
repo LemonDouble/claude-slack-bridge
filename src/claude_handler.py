@@ -8,11 +8,9 @@ full context (tool use, reasoning) across messages in the same thread.
 If the session ID is lost (e.g. container restart), falls back to a one-shot
 ``claude -p`` with the formatted thread history as the prompt.
 
-Project detection: reads ``/app/projects.json`` to map Slack channels to
-project directories mounted at ``/projects/`` inside the container.  When a
-message arrives, the handler resolves the channel to a project path and runs
-``claude -p`` from that directory so Claude sees the project's CLAUDE.md and
-codebase.
+Project detection: scans ``/projects/`` for 1-depth subdirectories.  Each
+subdirectory is treated as a separate project.  The project for each thread
+is selected via Slack Block Kit interactions and tracked per thread_ts.
 """
 
 import asyncio
@@ -26,18 +24,7 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 SUBPROCESS_TIMEOUT = 300  # 5 minutes
-PROJECTS_CONFIG = Path("/app/projects.json")
-
-
-def _load_project_map() -> dict[str, str]:
-    """Load channel-name → container project-path mapping from projects.json."""
-    if not PROJECTS_CONFIG.exists():
-        logger.warning("No projects.json at %s — project detection disabled.", PROJECTS_CONFIG)
-        return {}
-    with open(PROJECTS_CONFIG) as f:
-        mapping = json.load(f)
-    logger.info("Loaded project map with %d entries.", len(mapping))
-    return mapping
+PROJECTS_ROOT = Path("/projects")
 
 
 class ClaudeHandler:
@@ -52,18 +39,46 @@ class ClaudeHandler:
         self._slack_client = slack_client
         self._bot_user_id: str = ""
         self._sessions: dict[str, str] = {}  # thread_ts → session UUID
-        self._project_map: dict[str, str] = _load_project_map()
-        # Resolved at startup: channel ID → container project path.
-        self._channel_id_to_project: dict[str, str] = {}
+        self._thread_projects: dict[str, str] = {}  # thread_ts → project dir
 
     async def initialize(self) -> None:
-        """Cache the bot's own user ID and resolve channel names to IDs."""
+        """Cache the bot's own user ID."""
         resp = await self._slack_client.auth_test()
         self._bot_user_id = resp["user_id"]
         logger.info("ClaudeHandler initialized, bot_user_id=%s", self._bot_user_id)
 
-        if self._project_map:
-            await self._resolve_channel_ids()
+    # ------------------------------------------------------------------
+    # Project scanning
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def scan_projects() -> list[str]:
+        """Return sorted list of project directory names under /projects."""
+        if not PROJECTS_ROOT.exists():
+            logger.warning("Projects root %s does not exist.", PROJECTS_ROOT)
+            return []
+        return sorted(
+            d.name for d in PROJECTS_ROOT.iterdir()
+            if d.is_dir() and not d.name.startswith(".")
+        )
+
+    def set_thread_project(self, thread_ts: str, project_name: str) -> str:
+        """Associate a thread with a project. Returns the full project path."""
+        project_dir = str(PROJECTS_ROOT / project_name)
+        self._thread_projects[thread_ts] = project_dir
+        return project_dir
+
+    def get_thread_project(self, thread_ts: str) -> str | None:
+        """Get the project directory for a thread."""
+        return self._thread_projects.get(thread_ts)
+
+    @staticmethod
+    def create_project(name: str) -> str:
+        """Create a new project directory. Returns the full path."""
+        project_dir = PROJECTS_ROOT / name
+        project_dir.mkdir(parents=True, exist_ok=True)
+        logger.info("Created project directory: %s", project_dir)
+        return str(project_dir)
 
     # ------------------------------------------------------------------
     # Public API
@@ -75,14 +90,14 @@ class ClaudeHandler:
         self._sessions[message_ts] = session_id
         logger.info("New Claude session %s for thread %s", session_id, message_ts)
 
-        project_dir = self._get_project_dir(channel)
+        project_dir = self._thread_projects.get(message_ts)
         cmd = self._build_cmd(session_id=session_id)
         return await self._run_claude(cmd, text, cwd=project_dir)
 
     async def handle_thread_reply(self, channel: str, thread_ts: str, text: str) -> str:
         """Handle a threaded reply (resume existing session or fallback)."""
         session_id = self._sessions.get(thread_ts)
-        project_dir = self._get_project_dir(channel)
+        project_dir = self._thread_projects.get(thread_ts)
 
         if session_id:
             logger.info("Resuming session %s for thread %s", session_id, thread_ts)
@@ -98,40 +113,6 @@ class ClaudeHandler:
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
-
-    def _get_project_dir(self, channel_id: str) -> str | None:
-        """Look up the mounted project directory for a Slack channel ID."""
-        project_dir = self._channel_id_to_project.get(channel_id)
-        if project_dir:
-            logger.info("Channel %s → project %s", channel_id, project_dir)
-        else:
-            logger.info("No project mapping for channel %s — using default cwd.", channel_id)
-        return project_dir
-
-    async def _resolve_channel_ids(self) -> None:
-        """Resolve channel names from project_map to Slack channel IDs."""
-        try:
-            result = await self._slack_client.conversations_list(
-                types="public_channel,private_channel", limit=1000,
-            )
-            channels = result.get("channels", [])
-
-            name_to_id: dict[str, str] = {}
-            for ch in channels:
-                name_to_id[f"#{ch['name']}"] = ch["id"]
-                name_to_id[ch["name"]] = ch["id"]
-                name_to_id[ch["id"]] = ch["id"]  # allow raw IDs in config
-
-            for channel_key, project_path in self._project_map.items():
-                channel_id = name_to_id.get(channel_key)
-                if channel_id:
-                    self._channel_id_to_project[channel_id] = project_path
-                    logger.info("Mapped %s (ID: %s) → %s", channel_key, channel_id, project_path)
-                else:
-                    logger.warning("Channel %s not found in workspace — skipping.", channel_key)
-
-        except Exception as exc:
-            logger.error("Failed to resolve channel IDs: %s", exc)
 
     @staticmethod
     def _build_cmd(
@@ -161,7 +142,7 @@ class ClaudeHandler:
             )
         except FileNotFoundError:
             logger.error("claude CLI not found — is it installed and in PATH?")
-            return "Sorry, the Claude CLI is not available."
+            return "죄송합니다. Claude CLI를 사용할 수 없습니다."
 
         try:
             stdout_bytes, stderr_bytes = await asyncio.wait_for(
@@ -172,7 +153,7 @@ class ClaudeHandler:
             process.kill()
             await process.wait()
             logger.error("Claude subprocess timed out after %ds", SUBPROCESS_TIMEOUT)
-            return "Sorry, the request timed out. Please try again."
+            return "죄송합니다. 요청 시간이 초과되었습니다. 다시 시도해주세요."
 
         if process.returncode != 0:
             stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
@@ -181,7 +162,7 @@ class ClaudeHandler:
                 "Claude CLI failed (rc=%d) stderr: %s | stdout: %s | cmd: %s | prompt: %r",
                 process.returncode, stderr_text, stdout_text, cmd, prompt[:200],
             )
-            return "Sorry, I encountered an error processing your request."
+            return "죄송합니다. 요청 처리 중 오류가 발생했습니다."
 
         stdout_text = stdout_bytes.decode("utf-8", errors="replace").strip()
         return self._parse_response(stdout_text)
@@ -191,7 +172,6 @@ class ClaudeHandler:
         """Extract the response text from JSON output, or return raw text."""
         try:
             data = json.loads(raw)
-            # The JSON output has a "result" field with the response text.
             if isinstance(data, dict) and "result" in data:
                 return data["result"]
             return raw

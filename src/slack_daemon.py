@@ -11,11 +11,16 @@ unblocking the waiting session with zero polling.
 Additionally, the daemon handles Human→Claude messages: top-level Slack
 messages (and threaded replies with no pending MCP session) are forwarded to
 the Claude Code CLI, and the response is posted back as a thread reply.
+
+Project selection: when a user mentions the bot, a Block Kit UI is shown
+with available projects (scanned from /projects/) and a "New Project" button.
+Selecting a project starts a Claude thread in that project directory.
 """
 
 import asyncio
 import logging
 import os
+import re
 from typing import Any
 
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
@@ -49,7 +54,73 @@ class SlackDaemon:
         self._active_threads: set[str] = set()
         self._bot_user_id: str = ""
 
+        # Register event/action/view handlers
         self._app.event("message")(self._handle_slack_message)
+        self._app.action(re.compile(r"^select_project:.+$"))(self._handle_project_select)
+        self._app.action("create_project")(self._handle_create_project)
+        self._app.view("create_project_modal")(self._handle_create_project_modal)
+
+    # ------------------------------------------------------------------
+    # Block Kit builders
+    # ------------------------------------------------------------------
+
+    def _build_project_blocks(self) -> list[dict]:
+        """Build Block Kit blocks with project buttons + create new button."""
+        projects = self._claude.scan_projects()
+
+        blocks: list[dict] = [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": "*프로젝트를 선택하세요:*",
+                },
+            },
+        ]
+
+        if projects:
+            # Chunk projects into groups of 5 (Slack actions block limit)
+            for i in range(0, len(projects), 5):
+                chunk = projects[i : i + 5]
+                elements = [
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": name, "emoji": True},
+                        "action_id": f"select_project:{name}",
+                        "value": name,
+                    }
+                    for name in chunk
+                ]
+                blocks.append({"type": "actions", "elements": elements})
+        else:
+            blocks.append(
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": "_프로젝트가 없습니다. 새로 만들어 시작하세요._",
+                    },
+                }
+            )
+
+        # Always add "New Project" button at the end
+        blocks.append({
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "+ 새 프로젝트", "emoji": True},
+                    "action_id": "create_project",
+                    "style": "primary",
+                },
+            ],
+        })
+
+        return blocks
+
+    # ------------------------------------------------------------------
+    # Slack event handlers
+    # ------------------------------------------------------------------
 
     async def _handle_slack_message(self, event: dict[str, Any]) -> None:
         # Filter: Ignore bot messages (prevents self-echo loops).
@@ -81,7 +152,10 @@ class SlackDaemon:
         if thread_ts:
             if thread_ts in self._active_threads:
                 return
-            asyncio.create_task(self._handle_claude_thread_reply(channel, thread_ts, text))
+            # Only continue if this thread has a project assigned
+            if self._claude.get_thread_project(thread_ts):
+                message_ts = event.get("ts", thread_ts)
+                asyncio.create_task(self._handle_claude_thread_reply(channel, thread_ts, text, message_ts))
             return
 
         # Case 3: Top-level message — only respond if the bot is mentioned.
@@ -89,49 +163,282 @@ class SlackDaemon:
         if mention_tag not in text:
             return
 
-        # Strip the mention from the text so Claude sees clean input.
-        text = text.replace(mention_tag, "").strip()
+        # Show project selection UI
+        await self._app.client.chat_postMessage(
+            channel=channel,
+            text="프로젝트를 선택하세요:",
+            blocks=self._build_project_blocks(),
+        )
 
-        message_ts: str = event.get("ts", "")
-        if message_ts in self._active_threads:
+    # ------------------------------------------------------------------
+    # Action handlers (Block Kit interactions)
+    # ------------------------------------------------------------------
+
+    async def _handle_project_select(self, ack: Any, body: dict[str, Any]) -> None:
+        """Handle project button click — start a Claude thread."""
+        await ack()
+
+        action = body["actions"][0]
+        project_name = action["value"]
+        channel = body["channel"]["id"]
+        original_ts = body["message"]["ts"]
+
+        # Update the original message to show selected project
+        await self._app.client.chat_update(
+            channel=channel,
+            ts=original_ts,
+            text=f"프로젝트: *{project_name}*",
+            blocks=[
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"*프로젝트: {project_name}*",
+                    },
+                },
+            ],
+        )
+
+        # Post initial message in thread and start Claude session
+        thread_msg = await self._app.client.chat_postMessage(
+            channel=channel,
+            thread_ts=original_ts,
+            text=f"`{project_name}` 프로젝트가 선택되었습니다. 무엇을 도와드릴까요?",
+        )
+
+        # Associate this thread with the project
+        self._claude.set_thread_project(original_ts, project_name)
+        logger.info("Project %s selected for thread %s", project_name, original_ts)
+
+    async def _handle_create_project(self, ack: Any, body: dict[str, Any]) -> None:
+        """Handle 'New Project' button click — open modal."""
+        await ack()
+
+        trigger_id = body["trigger_id"]
+        channel = body["channel"]["id"]
+        original_ts = body["message"]["ts"]
+
+        await self._app.client.views_open(
+            trigger_id=trigger_id,
+            view={
+                "type": "modal",
+                "callback_id": "create_project_modal",
+                "private_metadata": f"{channel}:{original_ts}",
+                "title": {"type": "plain_text", "text": "새 프로젝트"},
+                "submit": {"type": "plain_text", "text": "생성"},
+                "close": {"type": "plain_text", "text": "취소"},
+                "blocks": [
+                    {
+                        "type": "input",
+                        "block_id": "project_name_block",
+                        "element": {
+                            "type": "plain_text_input",
+                            "action_id": "project_name_input",
+                            "placeholder": {
+                                "type": "plain_text",
+                                "text": "예: my-new-project",
+                            },
+                        },
+                        "label": {"type": "plain_text", "text": "프로젝트 이름"},
+                    },
+                ],
+            },
+        )
+
+    async def _handle_create_project_modal(self, ack: Any, body: dict[str, Any], view: dict[str, Any]) -> None:
+        """Handle modal submission — create project directory and start thread."""
+        values = view["state"]["values"]
+        project_name = values["project_name_block"]["project_name_input"]["value"].strip()
+
+        # Validate: only allow alphanumeric, hyphens, underscores
+        if not re.match(r"^[a-zA-Z0-9][a-zA-Z0-9_-]*$", project_name):
+            await ack({
+                "response_action": "errors",
+                "errors": {
+                    "project_name_block": "프로젝트 이름은 영문자 또는 숫자로 시작하며, 영문자, 숫자, 하이픈(-), 밑줄(_)만 사용할 수 있습니다.",
+                },
+            })
             return
-        asyncio.create_task(self._handle_claude_new_message(channel, message_ts, text))
+
+        # Check if project already exists
+        existing = self._claude.scan_projects()
+        if project_name in existing:
+            await ack({
+                "response_action": "errors",
+                "errors": {
+                    "project_name_block": f"'{project_name}' 프로젝트가 이미 존재합니다.",
+                },
+            })
+            return
+
+        await ack()
+
+        # Create the project directory
+        self._claude.create_project(project_name)
+
+        # Parse channel and original_ts from private_metadata
+        private_metadata = view.get("private_metadata", "")
+        channel, original_ts = private_metadata.split(":", 1)
+
+        # Update the original message
+        await self._app.client.chat_update(
+            channel=channel,
+            ts=original_ts,
+            text=f"프로젝트: *{project_name}* (신규)",
+            blocks=[
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"*프로젝트: {project_name}* _(신규)_",
+                    },
+                },
+            ],
+        )
+
+        # Post initial message in thread
+        await self._app.client.chat_postMessage(
+            channel=channel,
+            thread_ts=original_ts,
+            text=f"`{project_name}` 프로젝트가 생성되었습니다. 무엇을 도와드릴까요?",
+        )
+
+        # Associate thread with the new project
+        self._claude.set_thread_project(original_ts, project_name)
+        logger.info("New project %s created for thread %s", project_name, original_ts)
+
+    # ------------------------------------------------------------------
+    # Claude conversation handlers
+    # ------------------------------------------------------------------
+
+    async def _add_reaction(self, channel: str, timestamp: str, name: str) -> None:
+        """Add an emoji reaction to a message, ignoring errors."""
+        try:
+            await self._app.client.reactions_add(channel=channel, timestamp=timestamp, name=name)
+        except Exception as exc:
+            logger.warning("Failed to add reaction %s: %s", name, exc)
+
+    async def _remove_reaction(self, channel: str, timestamp: str, name: str) -> None:
+        """Remove an emoji reaction from a message, ignoring errors."""
+        try:
+            await self._app.client.reactions_remove(channel=channel, timestamp=timestamp, name=name)
+        except Exception as exc:
+            logger.warning("Failed to remove reaction %s: %s", name, exc)
 
     async def _handle_claude_new_message(self, channel: str, message_ts: str, text: str) -> None:
         """Spawn Claude for a new top-level message and post the response as a thread reply."""
         self._active_threads.add(message_ts)
+        await self._add_reaction(channel, message_ts, "hourglass_flowing_sand")
         try:
             response = await self._claude.handle_message(channel, message_ts, text)
             await self._post_response(channel, message_ts, response)
+            await self._remove_reaction(channel, message_ts, "hourglass_flowing_sand")
+            await self._add_reaction(channel, message_ts, "white_check_mark")
         except Exception as exc:
             logger.error("Error handling top-level message %s: %s", message_ts, exc)
+            await self._remove_reaction(channel, message_ts, "hourglass_flowing_sand")
+            await self._add_reaction(channel, message_ts, "x")
         finally:
             self._active_threads.discard(message_ts)
 
-    async def _handle_claude_thread_reply(self, channel: str, thread_ts: str, text: str) -> None:
+    async def _handle_claude_thread_reply(self, channel: str, thread_ts: str, text: str, message_ts: str | None = None) -> None:
         """Spawn Claude for a thread reply and post the response."""
+        react_ts = message_ts or thread_ts
+        logger.info("Handling thread reply: thread=%s, react_ts=%s, channel=%s", thread_ts, react_ts, channel)
         self._active_threads.add(thread_ts)
+        await self._add_reaction(channel, react_ts, "hourglass_flowing_sand")
         try:
             response = await self._claude.handle_thread_reply(channel, thread_ts, text)
             await self._post_response(channel, thread_ts, response)
+            await self._remove_reaction(channel, react_ts, "hourglass_flowing_sand")
+            await self._add_reaction(channel, react_ts, "white_check_mark")
         except Exception as exc:
             logger.error("Error in thread continuation %s: %s", thread_ts, exc)
+            await self._remove_reaction(channel, react_ts, "hourglass_flowing_sand")
+            await self._add_reaction(channel, react_ts, "x")
         finally:
             self._active_threads.discard(thread_ts)
 
+    @staticmethod
+    def _markdown_to_slack(text: str) -> str:
+        """Convert standard Markdown to Slack mrkdwn format."""
+        # Headers: ## Header → *Header*
+        text = re.sub(r"^#{1,6}\s+(.+)$", r"*\1*", text, flags=re.MULTILINE)
+        # Bold: **text** → *text*
+        text = re.sub(r"\*\*(.+?)\*\*", r"*\1*", text)
+        # Italic: _text_ stays the same, but *text* (single) that isn't bold needs care
+        # Strikethrough: ~~text~~ → ~text~
+        text = re.sub(r"~~(.+?)~~", r"~\1~", text)
+        # Links: [text](url) → <url|text>
+        text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"<\2|\1>", text)
+        # Images: ![alt](url) → <url|alt> (best effort in Slack)
+        text = re.sub(r"!\[([^\]]*)\]\(([^)]+)\)", r"<\2|\1>", text)
+        return text
+
+    @staticmethod
+    def _split_message(text: str, max_length: int) -> list[str]:
+        """Split text into chunks at line boundaries, preserving code blocks."""
+        if len(text) <= max_length:
+            return [text]
+
+        chunks: list[str] = []
+        current = ""
+        in_code_block = False
+
+        for line in text.split("\n"):
+            line_with_newline = line + "\n"
+
+            # Track code block state
+            if line.startswith("```"):
+                in_code_block = not in_code_block
+
+            # If adding this line would exceed the limit, flush current chunk
+            if current and len(current) + len(line_with_newline) > max_length:
+                # If we're inside a code block, close it in the current chunk
+                if in_code_block:
+                    current += "```\n"
+                chunks.append(current.rstrip("\n"))
+                # Re-open code block in the next chunk
+                current = "```\n" + line_with_newline if in_code_block else line_with_newline
+            else:
+                current += line_with_newline
+
+        if current.strip():
+            chunks.append(current.rstrip("\n"))
+
+        return chunks
+
     async def _post_response(self, channel: str, thread_ts: str, text: str) -> None:
-        """Post a response to Slack, splitting if it exceeds the message length limit."""
-        if len(text) <= SLACK_MAX_MESSAGE_LENGTH:
+        """Post a response to Slack, splitting if it exceeds the message length limit.
+
+        For very long responses (>3 chunks), uploads as a text file instead.
+        """
+        text = self._markdown_to_slack(text)
+
+        chunks = self._split_message(text, SLACK_MAX_MESSAGE_LENGTH)
+
+        # If it's too many chunks, upload as a file instead
+        if len(chunks) > 3:
             await self._app.client.chat_postMessage(
-                channel=channel, thread_ts=thread_ts, text=text, mrkdwn=True,
+                channel=channel, thread_ts=thread_ts,
+                text=text[:3000] + "\n\n_(전체 응답은 파일로 첨부되었습니다)_",
+                mrkdwn=True,
+            )
+            await self._app.client.files_upload_v2(
+                channel=channel, thread_ts=thread_ts,
+                content=text, filename="response.md",
+                title="전체 응답",
             )
             return
 
-        for i in range(0, len(text), SLACK_MAX_MESSAGE_LENGTH):
-            chunk = text[i : i + SLACK_MAX_MESSAGE_LENGTH]
+        for chunk in chunks:
             await self._app.client.chat_postMessage(
                 channel=channel, thread_ts=thread_ts, text=chunk, mrkdwn=True,
             )
+
+    # ------------------------------------------------------------------
+    # Unix socket server (MCP session relay)
+    # ------------------------------------------------------------------
 
     async def _handle_session_connection(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
@@ -152,7 +459,6 @@ class SlackDaemon:
             logger.info("Session registered for thread %s.", thread_ts)
 
             # Block until the session disconnects (reader.read returns b"" on close).
-            # This ensures _pending is cleaned up if the session exits before a reply arrives.
             await reader.read(1)
 
         except Exception as exc:
