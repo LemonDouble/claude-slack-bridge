@@ -1,5 +1,5 @@
-# Project Instructions
+# 프로젝트 지침
 
-## Communication
+## 커뮤니케이션
 
-Once you use `mcp__claude-slack-bridge__ask_on_slack` for the first time in a conversation, ALL further communication with the user must go through that tool. Do not use `AskUserQuestion`, and do not ask questions or request feedback as text in the terminal. Continue communicating exclusively via Slack until the user explicitly tells you to switch back to the terminal.
+대화에서 `mcp__claude-slack-bridge__ask_on_slack`을 처음 사용한 이후부터는 모든 커뮤니케이션을 해당 도구를 통해 수행해야 합니다. `AskUserQuestion`을 사용하거나 터미널에 텍스트로 질문이나 피드백 요청을 하지 마세요. 사용자가 명시적으로 터미널로 전환하라고 지시할 때까지 Slack을 통해서만 소통하세요.
