@@ -1,13 +1,13 @@
 # Claude ↔ Slack Bridge
 
-A two-way bridge between Claude Code and Slack:
+Claude Code와 Slack을 연결하는 양방향 브릿지입니다.
 
-- **Claude → Slack:** Claude pauses mid-task, asks a question via Slack, waits for your reply, and resumes.
-- **Slack → Claude:** Tag the bot in a Slack channel and Claude runs with full project context — it knows which project to work on based on the channel.
+- **Claude → Slack:** Claude가 작업 중 질문이 필요하면 Slack으로 메시지를 보내고, 답변을 기다린 후 작업을 재개합니다.
+- **Slack → Claude:** Slack에서 봇을 멘션하면 프로젝트를 선택하는 UI가 나타나고, 해당 프로젝트 컨텍스트로 Claude가 실행됩니다.
 
 ```
-Claude Code  ──ask_on_slack──▶  Slack channel  ──your reply──▶  Claude Code resumes
-Slack @bot   ──────────────────▶  claude -p (in project dir) ──▶  reply in thread
+Claude Code  ──ask_on_slack──▶  Slack 채널  ──답변──▶  Claude Code 재개
+Slack @bot   ──프로젝트 선택──▶  claude -p (프로젝트 디렉토리) ──▶  스레드에 답변
 ```
 
 ---
@@ -15,64 +15,64 @@ Slack @bot   ──────────────────▶  claude -
 
 
 
-## What It Does
+## 주요 기능
 
-When Claude is mid-task and needs a human decision — approval, clarification, a missing credential — it calls the `ask_on_slack` MCP tool. The bridge:
+Claude가 작업 중 사람의 판단이 필요한 경우(승인, 확인, 누락된 정보 등) `ask_on_slack` MCP 도구를 호출합니다. 브릿지는 다음과 같이 동작합니다:
 
-1. Posts the question to a Slack channel.
-2. Blocks Claude's execution and waits.
-3. Captures your reply — **you must reply in the Slack thread, not in the channel directly**.
-4. Returns the reply text to Claude, which continues from where it left off.
+1. Slack 채널에 질문을 게시합니다.
+2. Claude의 실행을 차단하고 대기합니다.
+3. 답변을 수신합니다 — **반드시 Slack 스레드에서 답변해야 합니다. 채널에 직접 보낸 메시지는 인식되지 않습니다.**
+4. 답변을 Claude에게 전달하고, Claude는 이어서 작업을 계속합니다.
 
-Multiple concurrent sessions and requests are all handled correctly — each is keyed to its own Slack thread so replies always reach the right waiter.
+여러 세션과 요청이 동시에 처리되며, 각각 고유한 Slack 스레드에 매핑되어 답변이 올바른 대기자에게 전달됩니다.
 
 ---
 
-## Architecture
+## 아키텍처
 
-The bridge uses a **daemon + session** model to support multiple Claude Code sessions simultaneously:
+**데몬 + 세션** 모델을 사용하여 여러 Claude Code 세션을 동시에 지원합니다.
 
-- **Daemon** (persistent Docker container): holds one Slack Socket Mode WebSocket connection and a Unix domain socket server. Receives all Slack reply events and routes them to the correct waiting session.
-- **Session** (started per Claude session via `docker exec`): runs the MCP stdio server, posts messages to Slack, and blocks on the Unix socket waiting for the daemon to forward the reply. Zero polling — OS-level blocking I/O.
+- **데몬** (상시 실행 Docker 컨테이너): Slack Socket Mode WebSocket 연결 하나와 Unix 도메인 소켓 서버를 유지합니다. 모든 Slack 답변 이벤트를 수신하고 올바른 대기 세션으로 라우팅합니다.
+- **세션** (Claude 세션마다 `docker exec`으로 시작): MCP stdio 서버를 실행하고, Slack에 메시지를 게시한 후, 데몬이 답변을 전달할 때까지 Unix 소켓에서 블로킹 대기합니다. 폴링 없이 OS 수준의 블로킹 I/O를 사용합니다.
 
 ```
-Container (always running):
+컨테이너 (상시 실행):
   main.py → SlackDaemon
     ├── Slack Socket Mode WebSocket
-    └── Unix socket at /tmp/slack-bridge.sock
+    └── Unix 소켓: /tmp/slack-bridge.sock
 
-Per Claude session (docker exec):
+Claude 세션별 (docker exec):
   session.py
-    ├── Posts message → Slack HTTP API  (uses SLACK_CHANNEL from .mcp.json)
-    └── Awaits reply  → /tmp/slack-bridge.sock
+    ├── 메시지 게시 → Slack HTTP API (SLACK_CHANNEL은 .mcp.json에서 설정)
+    └── 답변 대기 → /tmp/slack-bridge.sock
 ```
 
-This means `SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN` live only in `.env` (set once). Each project's `.mcp.json` only needs `SLACK_CHANNEL`.
+`SLACK_BOT_TOKEN`과 `SLACK_APP_TOKEN`은 `.env`에만 설정하면 됩니다(한 번만). 각 프로젝트의 `.mcp.json`에는 `SLACK_CHANNEL`만 지정하면 됩니다.
 
 ---
 
-## Quickstart
+## 빠른 시작
 
-### 1. Create a Slack app and get tokens
+### 1. Slack 앱 생성 및 토큰 발급
 
-Follow [docs/slack-setup.md](docs/slack-setup.md) to create a Slack app, get your `xoxb-` and `xapp-` tokens, and invite the bot to a channel.
+[docs/slack-setup.md](docs/slack-setup.md)를 참고하여 Slack 앱을 생성하고, `xoxb-` 및 `xapp-` 토큰을 발급받은 후, 봇을 채널에 초대하세요.
 
-### 2. Clone, configure, and start the daemon
+### 2. 클론, 설정, 데몬 시작
 
 ```bash
 git clone https://github.com/your-username/claude-slack-bridge.git
 cd claude-slack-bridge
-cp .env.example .env   # fill in SLACK_BOT_TOKEN and SLACK_APP_TOKEN
+cp .env.example .env   # SLACK_BOT_TOKEN과 SLACK_APP_TOKEN을 입력하세요
 docker compose up -d --build
 ```
 
-The container starts automatically on system boot (`restart: unless-stopped`) and uses Socket Mode — no public URL or inbound firewall rules needed.
+컨테이너는 시스템 부팅 시 자동으로 시작되며(`restart: unless-stopped`), Socket Mode를 사용하므로 공개 URL이나 인바운드 방화벽 규칙이 필요 없습니다.
 
-**You only do this once.** The daemon stays running in the background and serves all your Claude Code projects.
+**이 작업은 한 번만 수행합니다.** 데몬은 백그라운드에서 계속 실행되며 모든 Claude Code 프로젝트를 서비스합니다.
 
-### 3. Add `.mcp.json` to your Claude Code project
+### 3. Claude Code 프로젝트에 `.mcp.json` 추가
 
-Create `.mcp.json` in the root of any project where you want Claude to be able to ask you questions:
+Claude가 질문할 수 있도록 하려는 프로젝트의 루트에 `.mcp.json`을 생성하세요:
 
 ```json
 {
@@ -95,126 +95,122 @@ Create `.mcp.json` in the root of any project where you want Claude to be able t
 }
 ```
 
-> **Important:** Add `.mcp.json` to your `.gitignore` — it contains your channel name and is project-specific.
+> **중요:** `.mcp.json`을 `.gitignore`에 추가하세요 — 채널 이름이 포함되어 있으며 프로젝트별로 다릅니다.
 
-### 4. Add the Slack communication rule to your `CLAUDE.md`
+### 4. `CLAUDE.md`에 Slack 통신 규칙 추가
 
-To make Claude automatically use Slack for all communication once it sends its first message, add the following to your project's `CLAUDE.md`:
+Claude가 첫 메시지를 보낸 후 자동으로 모든 커뮤니케이션을 Slack으로 전환하도록 하려면, 프로젝트의 `CLAUDE.md`에 다음을 추가하세요:
 
 ```markdown
 Once you use `mcp__claude-slack-bridge__ask_on_slack` for the first time in a conversation, ALL further communication with the user must go through that tool. Do not use `AskUserQuestion`, and do not ask questions or request feedback as text in the terminal. Continue communicating exclusively via Slack until the user explicitly tells you to switch back to the terminal.
 ```
 
-Without this, Claude will only use Slack when it decides to — with it, Claude locks in to Slack after the first message and stays there for the rest of the session.
+이 규칙이 없으면 Claude는 필요할 때만 Slack을 사용하지만, 이 규칙이 있으면 첫 메시지 이후 세션이 끝날 때까지 Slack을 통해서만 소통합니다.
 
-That's it. Open the project in Claude Code and Claude will have access to `ask_on_slack`.
+설정 완료입니다. Claude Code에서 프로젝트를 열면 `ask_on_slack` 도구를 사용할 수 있습니다.
 
 ---
 
-## Configuration
+## 설정
 
-### `.env` (daemon — set once, shared across all projects)
+### `.env` (데몬 — 한 번만 설정, 모든 프로젝트 공유)
 
-| Variable | Required | Description |
+| 변수 | 필수 | 설명 |
 |---|---|---|
-| `SLACK_BOT_TOKEN` | Yes | Bot OAuth token (`xoxb-...`) |
-| `SLACK_APP_TOKEN` | Yes | Socket Mode app token (`xapp-...`) |
-| `PROJECTS_DIR` | Yes | Absolute path to the parent directory containing all your projects |
+| `SLACK_BOT_TOKEN` | Yes | Bot OAuth 토큰 (`xoxb-...`) |
+| `SLACK_APP_TOKEN` | Yes | Socket Mode 앱 토큰 (`xapp-...`) |
+| `PROJECTS_DIR` | Yes | 모든 프로젝트가 포함된 상위 디렉토리의 절대 경로 |
 
-### `.mcp.json` (per project — set per Claude Code project)
+### `.mcp.json` (프로젝트별 — Claude Code 프로젝트마다 설정)
 
-| Variable | Required | Default | Description |
+| 변수 | 필수 | 기본값 | 설명 |
 |---|---|---|---|
-| `SLACK_CHANNEL` | Yes | — | Target channel name or ID (e.g. `#my-project`) |
-| `TIMEOUT_LIMIT_MINUTES` | No | `5` | Minutes to wait before timing out |
+| `SLACK_CHANNEL` | Yes | — | 대상 채널 이름 또는 ID (예: `#my-project`) |
+| `TIMEOUT_LIMIT_MINUTES` | No | `5` | 타임아웃까지 대기 시간(분) |
 
-Set `SLACK_CHANNEL` per project so each project posts to its own dedicated channel.
-
----
-
-## The `ask_on_slack` Tool
-
-Claude calls this tool automatically whenever it needs a human decision it cannot resolve from context.
-
-**Input:** `message` — the question or statement to send.
-**Output:** the text of your reply.
-**Timeout:** raises an error if no reply arrives within `TIMEOUT_LIMIT_MINUTES`.
-
-> **Reply in the thread.** When the message appears in Slack, click **Reply** to open the thread and type your answer there. A top-level message in the channel will not be picked up.
-
-You can also prompt Claude explicitly:
-
-> *"Ask on Slack whether you should overwrite the existing file."*
+프로젝트마다 `SLACK_CHANNEL`을 설정하여 각 프로젝트가 전용 채널에 메시지를 게시하도록 합니다.
 
 ---
 
-## Slack → Claude (Project-Aware Bot)
+## `ask_on_slack` 도구
 
-You can also tag the bot directly in Slack to interact with a project. The bot detects which project to use based on the channel.
+Claude가 컨텍스트만으로는 해결할 수 없는 결정이 필요할 때 자동으로 이 도구를 호출합니다.
 
-### How it works
+**입력:** `message` — 보낼 질문 또는 메시지
+**출력:** 답변 텍스트
+**타임아웃:** `TIMEOUT_LIMIT_MINUTES` 내에 답변이 없으면 에러 발생
 
-1. You tag `@claude-bot` in a Slack channel (e.g. `#my-project`).
-2. The daemon looks up the channel in `projects.json` to find the matching project directory.
-3. It runs `claude -p` from that project directory inside the container — so Claude sees the project's `CLAUDE.md`, codebase, and full context.
-4. The response is posted back as a thread reply.
-5. You can continue the conversation by replying in the thread.
+> **스레드에서 답변하세요.** Slack에 메시지가 나타나면 **답변(Reply)**을 클릭하여 스레드를 열고 답변을 입력하세요. 채널에 직접 보낸 메시지는 인식되지 않습니다.
 
-### Setup
+명시적으로 Claude에게 요청할 수도 있습니다:
 
-#### 1. Set `PROJECTS_DIR` in `.env`
+> *"기존 파일을 덮어쓸지 Slack에서 물어봐."*
 
-Point it to the parent directory that contains all your projects:
+---
+
+## Slack → Claude (프로젝트 인식 봇)
+
+Slack 채널에서 봇을 멘션하면 Claude 세션이 시작됩니다. Block Kit UI로 프로젝트를 선택할 수 있어 채널-프로젝트 매핑이 필요 없습니다.
+
+### 동작 방식
+
+1. Slack 채널에서 `@claude-bot`을 멘션합니다.
+2. `PROJECTS_DIR`에서 발견된 프로젝트 목록이 버튼 형태의 인터랙티브 UI로 표시됩니다.
+3. 프로젝트를 클릭하면 스레드가 생성되고, 해당 프로젝트 디렉토리에서 Claude가 실행됩니다(`CLAUDE.md`, 코드베이스 등 참조 가능).
+4. 스레드에서 답변하여 대화를 계속합니다.
+5. 새 프로젝트가 필요하면 **"+ New Project"** 버튼을 클릭 → 모달에서 이름을 입력 → 폴더가 생성되고 스레드가 바로 시작됩니다.
+
+### 설정
+
+#### 1. `.env`에 `PROJECTS_DIR` 설정
+
+모든 프로젝트가 포함된 상위 디렉토리를 지정하세요:
 
 ```
-PROJECTS_DIR=C:\Users\you\projects
+PROJECTS_DIR=/path/to/your/projects
 ```
 
-This directory is mounted into the container at `/projects/`.
+이 디렉토리는 컨테이너 내부의 `/projects/`에 마운트됩니다. **1단계 하위 디렉토리**가 각각 별도의 프로젝트로 인식됩니다.
 
-#### 2. Create `projects.json`
-
-Map each Slack channel to its project folder name (relative to `/projects/` inside the container):
-
-```json
-{
-  "#my-project-channel": "/projects/my-project",
-  "#another-channel": "/projects/another-project"
-}
+```
+/path/to/your/projects/
+├── project-a/     ← "project-a" 버튼으로 표시
+├── project-b/     ← "project-b" 버튼으로 표시
+└── my-app/        ← "my-app" 버튼으로 표시
 ```
 
-> **Tip:** The folder names must match the directory names inside `PROJECTS_DIR`. For example, if `PROJECTS_DIR=C:\Users\you\projects` and you have `C:\Users\you\projects\my-project`, then the container path is `/projects/my-project`.
+#### 2. Slack 앱에서 Interactivity 활성화
 
-See `projects.json.example` for a template.
+Block Kit 버튼과 모달을 사용하므로 Slack 앱 설정에서 **Interactivity**를 활성화해야 합니다. Socket Mode가 페이로드를 처리하므로 Request URL은 필요 없습니다 — 토글만 켜면 됩니다.
 
-#### 3. Rebuild
+#### 3. 재빌드
 
 ```bash
 docker compose up -d --build
 ```
 
-#### Adding new projects
+#### 새 프로젝트 추가
 
-Just add a line to `projects.json` and rebuild. No changes to `docker-compose.yml` needed.
+`PROJECTS_DIR` 안에 폴더를 생성하기만 하면 됩니다 — 설정 변경이나 재빌드가 필요 없습니다. 봇이 멘션될 때마다 디렉토리를 스캔합니다.
+
+Slack에서 **"+ New Project"** 버튼을 사용하여 직접 프로젝트를 생성할 수도 있습니다.
 
 ---
 
-## Project Structure
+## 프로젝트 구조
 
 ```
-claude-slack-two-way/
+claude-slack-bridge/
 ├── src/
-│   ├── main.py            # Daemon entry point — starts SlackDaemon
-│   ├── session.py         # Session entry point — MCP stdio server (docker exec target)
-│   ├── slack_daemon.py    # Slack Socket Mode + Unix socket server
-│   ├── session_broker.py  # Unix socket client — posts message, awaits reply
-│   ├── mcp_server.py      # Registers the ask_on_slack MCP tool
-│   └── config.py          # Environment variable validation (pydantic-settings)
+│   ├── main.py            # 데몬 진입점 — SlackDaemon 시작
+│   ├── session.py         # 세션 진입점 — MCP stdio 서버 (docker exec 대상)
+│   ├── slack_daemon.py    # Slack Socket Mode + Unix 소켓 서버
+│   ├── session_broker.py  # Unix 소켓 클라이언트 — 메시지 게시, 답변 대기
+│   ├── mcp_server.py      # ask_on_slack MCP 도구 등록
+│   └── config.py          # 환경 변수 유효성 검사 (pydantic-settings)
 ├── docs/
-│   ├── slack-setup.md        # Step-by-step Slack app creation guide
-│   └── mcp-client-setup.md   # How to wire .mcp.json in a Claude Code project
-├── projects.json          # Channel → project path mapping (gitignored)
-├── projects.json.example  # Template for projects.json
+│   ├── slack-setup.md        # Slack 앱 생성 단계별 가이드
+│   └── mcp-client-setup.md   # Claude Code 프로젝트에 .mcp.json 설정 방법
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
@@ -222,26 +218,26 @@ claude-slack-two-way/
 
 ---
 
-## How It Works (Internals)
+## 동작 원리 (내부 구조)
 
-1. **Daemon starts** (`docker compose up -d`): `SlackDaemon` connects to Slack via Socket Mode and opens a Unix domain socket at `/tmp/slack-bridge.sock` inside the container.
-2. **Claude calls `ask_on_slack`**: a session process (`session.py`) is already running inside the container via `docker exec`. It posts the message to Slack via the HTTP API using `SLACK_CHANNEL` from the project's `.mcp.json`.
-3. **Session registers with daemon**: the session connects to `/tmp/slack-bridge.sock` and sends `REGISTER {thread_ts}`. It then blocks — no polling, the OS wakes it when data arrives.
-4. **User replies in Slack**: the Socket Mode event arrives at the daemon. The daemon looks up the registered session for that `thread_ts`, writes the reply text to the Unix socket, and closes the connection.
-5. **Session unblocks**: reads the reply from the socket and returns it to Claude Code.
+1. **데몬 시작** (`docker compose up -d`): `SlackDaemon`이 Socket Mode로 Slack에 연결하고, 컨테이너 내부의 `/tmp/slack-bridge.sock`에 Unix 도메인 소켓을 엽니다.
+2. **Claude가 `ask_on_slack` 호출**: `docker exec`으로 컨테이너 내부에서 이미 실행 중인 세션 프로세스(`session.py`)가 프로젝트의 `.mcp.json`에 있는 `SLACK_CHANNEL`을 사용하여 Slack HTTP API로 메시지를 게시합니다.
+3. **세션이 데몬에 등록**: 세션이 `/tmp/slack-bridge.sock`에 연결하고 `REGISTER {thread_ts}`를 전송합니다. 이후 블로킹 대기 — 폴링 없이 데이터가 도착하면 OS가 깨워줍니다.
+4. **사용자가 Slack에서 답변**: Socket Mode 이벤트가 데몬에 도착합니다. 데몬은 해당 `thread_ts`에 등록된 세션을 찾아 Unix 소켓에 답변 텍스트를 쓰고 연결을 닫습니다.
+5. **세션 블로킹 해제**: 소켓에서 답변을 읽고 Claude Code에 반환합니다.
 
-Multiple concurrent sessions each have their own `docker exec` process and their own socket connection to the daemon. Replies are routed by `thread_ts` so they always reach the correct waiter.
-
----
-
-## Requirements
-
-- Docker (with Docker Compose)
-- A Slack workspace where you can create apps
-- Claude Code (or any MCP-compatible client)
+여러 동시 세션은 각각 고유한 `docker exec` 프로세스와 데몬에 대한 소켓 연결을 가집니다. `thread_ts`로 라우팅되어 답변이 항상 올바른 대기자에게 전달됩니다.
 
 ---
 
-## License
+## 요구 사항
+
+- Docker (Docker Compose 포함)
+- Slack 앱을 생성할 수 있는 Slack 워크스페이스
+- Claude Code (또는 MCP 호환 클라이언트)
+
+---
+
+## 라이선스
 
 MIT
