@@ -22,6 +22,8 @@ from collections.abc import Callable, Coroutine
 from pathlib import Path
 from typing import Any
 
+_STATE_FILE = Path.home() / ".claude" / "slack-bridge-state.json"
+
 OnEventFn = Callable[[dict[str, Any]], Coroutine[Any, Any, None]]
 
 logger = logging.getLogger(__name__)
@@ -44,12 +46,43 @@ class ClaudeHandler:
         self._idle_timeout = idle_timeout_minutes * 60
         self._sessions: dict[str, str] = {}  # thread_ts → session UUID
         self._thread_projects: dict[str, str] = {}  # thread_ts → project dir
+        self._load_state()
 
     async def initialize(self) -> None:
         """Cache the bot's own user ID."""
         resp = await self._slack_client.auth_test()
         self._bot_user_id = resp["user_id"]
         logger.info("ClaudeHandler initialized, bot_user_id=%s", self._bot_user_id)
+
+    # ------------------------------------------------------------------
+    # State persistence
+    # ------------------------------------------------------------------
+
+    def _load_state(self) -> None:
+        """Load persisted thread→project and thread→session mappings."""
+        if not _STATE_FILE.exists():
+            return
+        try:
+            data = json.loads(_STATE_FILE.read_text())
+            self._thread_projects = data.get("thread_projects", {})
+            self._sessions = data.get("sessions", {})
+            logger.info(
+                "Restored state: %d threads, %d sessions.",
+                len(self._thread_projects), len(self._sessions),
+            )
+        except Exception as exc:
+            logger.warning("Failed to load state: %s", exc)
+
+    def _save_state(self) -> None:
+        """Persist current mappings to disk."""
+        try:
+            _STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            _STATE_FILE.write_text(json.dumps({
+                "thread_projects": self._thread_projects,
+                "sessions": self._sessions,
+            }))
+        except Exception as exc:
+            logger.warning("Failed to save state: %s", exc)
 
     # ------------------------------------------------------------------
     # Project scanning
@@ -70,6 +103,7 @@ class ClaudeHandler:
         """Associate a thread with a project. Returns the full project path."""
         project_dir = str(PROJECTS_ROOT / project_name)
         self._thread_projects[thread_ts] = project_dir
+        self._save_state()
         return project_dir
 
     def get_thread_project(self, thread_ts: str) -> str | None:
@@ -95,6 +129,7 @@ class ClaudeHandler:
         """Handle a new top-level Slack message (start a new Claude session)."""
         session_id = str(uuid.uuid4())
         self._sessions[message_ts] = session_id
+        self._save_state()
         logger.info("New Claude session %s for thread %s", session_id, message_ts)
 
         project_dir = self._thread_projects.get(message_ts)
