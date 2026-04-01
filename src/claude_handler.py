@@ -18,12 +18,15 @@ import json
 import logging
 import os
 import uuid
+from collections.abc import Callable, Coroutine
 from pathlib import Path
 from typing import Any
 
+OnEventFn = Callable[[dict[str, Any]], Coroutine[Any, Any, None]]
+
 logger = logging.getLogger(__name__)
 
-SUBPROCESS_TIMEOUT = 300  # 5 minutes
+DEFAULT_IDLE_TIMEOUT = 43200  # 12 hours
 PROJECTS_ROOT = Path("/projects")
 
 
@@ -35,9 +38,10 @@ class ClaudeHandler:
         slack_client: An async Slack WebClient (``self._app.client``).
     """
 
-    def __init__(self, slack_client: Any) -> None:
+    def __init__(self, slack_client: Any, idle_timeout_minutes: int = 720) -> None:
         self._slack_client = slack_client
         self._bot_user_id: str = ""
+        self._idle_timeout = idle_timeout_minutes * 60
         self._sessions: dict[str, str] = {}  # thread_ts → session UUID
         self._thread_projects: dict[str, str] = {}  # thread_ts → project dir
 
@@ -84,7 +88,10 @@ class ClaudeHandler:
     # Public API
     # ------------------------------------------------------------------
 
-    async def handle_message(self, channel: str, message_ts: str, text: str) -> str:
+    async def handle_message(
+        self, channel: str, message_ts: str, text: str,
+        on_event: OnEventFn | None = None,
+    ) -> str:
         """Handle a new top-level Slack message (start a new Claude session)."""
         session_id = str(uuid.uuid4())
         self._sessions[message_ts] = session_id
@@ -92,9 +99,12 @@ class ClaudeHandler:
 
         project_dir = self._thread_projects.get(message_ts)
         cmd = self._build_cmd(session_id=session_id)
-        return await self._run_claude(cmd, text, cwd=project_dir)
+        return await self._run_claude(cmd, text, cwd=project_dir, on_event=on_event)
 
-    async def handle_thread_reply(self, channel: str, thread_ts: str, text: str) -> str:
+    async def handle_thread_reply(
+        self, channel: str, thread_ts: str, text: str,
+        on_event: OnEventFn | None = None,
+    ) -> str:
         """Handle a threaded reply (resume existing session or fallback)."""
         session_id = self._sessions.get(thread_ts)
         project_dir = self._thread_projects.get(thread_ts)
@@ -102,13 +112,13 @@ class ClaudeHandler:
         if session_id:
             logger.info("Resuming session %s for thread %s", session_id, thread_ts)
             cmd = self._build_cmd(resume=session_id)
-            return await self._run_claude(cmd, text, cwd=project_dir)
+            return await self._run_claude(cmd, text, cwd=project_dir, on_event=on_event)
 
         # Fallback: session lost (container restart) — use thread history as context.
         logger.info("No session for thread %s, falling back to thread history.", thread_ts)
         prompt = await self._build_thread_prompt(channel, thread_ts)
         cmd = self._build_cmd()
-        return await self._run_claude(cmd, prompt, cwd=project_dir)
+        return await self._run_claude(cmd, prompt, cwd=project_dir, on_event=on_event)
 
     # ------------------------------------------------------------------
     # Internals
@@ -119,15 +129,27 @@ class ClaudeHandler:
         session_id: str | None = None,
         resume: str | None = None,
     ) -> list[str]:
-        cmd = ["claude", "-p", "--dangerously-skip-permissions", "--output-format", "json"]
+        cmd = ["claude", "-p", "--dangerously-skip-permissions", "--output-format", "stream-json"]
         if session_id:
             cmd.extend(["--session-id", session_id])
         if resume:
             cmd.extend(["--resume", resume])
         return cmd
 
-    async def _run_claude(self, cmd: list[str], prompt: str, cwd: str | None = None) -> str:
-        """Spawn a ``claude -p`` subprocess and return the response text."""
+    async def _run_claude(
+        self, cmd: list[str], prompt: str, cwd: str | None = None,
+        on_event: OnEventFn | None = None,
+    ) -> str:
+        """Spawn a ``claude -p`` subprocess and return the response text.
+
+        Uses ``--output-format stream-json`` and reads stdout line-by-line so
+        that long-running tasks (hours) are never killed as long as Claude is
+        still producing output.  Only an *idle* timeout (no new output for
+        the configured seconds) will terminate the process.
+
+        If *on_event* is provided, each parsed JSON event is forwarded to it
+        so callers can post real-time progress to Slack.
+        """
         env = os.environ.copy()
         env.pop("CLAUDECODE", None)
 
@@ -144,39 +166,101 @@ class ClaudeHandler:
             logger.error("claude CLI not found — is it installed and in PATH?")
             return "죄송합니다. Claude CLI를 사용할 수 없습니다."
 
+        # Feed prompt and close stdin so Claude starts processing.
+        assert process.stdin is not None
+        process.stdin.write(prompt.encode("utf-8"))
+        await process.stdin.drain()
+        process.stdin.close()
+
+        # Stream stdout line-by-line with an idle timeout.
+        lines: list[str] = []
+        assert process.stdout is not None
         try:
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                process.communicate(input=prompt.encode("utf-8")),
-                timeout=SUBPROCESS_TIMEOUT,
-            )
-        except asyncio.TimeoutError:
+            while True:
+                try:
+                    line_bytes = await asyncio.wait_for(
+                        process.stdout.readline(), timeout=self._idle_timeout
+                    )
+                except asyncio.TimeoutError:
+                    process.kill()
+                    await process.wait()
+                    logger.error(
+                        "Claude subprocess idle-timed out after %ds", self._idle_timeout
+                    )
+                    return "죄송합니다. 요청 시간이 초과되었습니다. 다시 시도해주세요."
+
+                if not line_bytes:  # EOF
+                    break
+
+                line_str = line_bytes.decode("utf-8", errors="replace")
+                lines.append(line_str)
+
+                # Forward parsed event to callback.
+                if on_event:
+                    stripped = line_str.strip()
+                    if stripped:
+                        try:
+                            event = json.loads(stripped)
+                            await on_event(event)
+                        except (json.JSONDecodeError, Exception) as exc:
+                            logger.debug("on_event error: %s", exc)
+
+        except Exception:
             process.kill()
             await process.wait()
-            logger.error("Claude subprocess timed out after %ds", SUBPROCESS_TIMEOUT)
-            return "죄송합니다. 요청 시간이 초과되었습니다. 다시 시도해주세요."
+            raise
+
+        await process.wait()
 
         if process.returncode != 0:
+            stderr_bytes = await process.stderr.read() if process.stderr else b""
             stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
-            stdout_text = stdout_bytes.decode("utf-8", errors="replace").strip()
+            stdout_text = "".join(lines).strip()
             logger.error(
                 "Claude CLI failed (rc=%d) stderr: %s | stdout: %s | cmd: %s | prompt: %r",
                 process.returncode, stderr_text, stdout_text, cmd, prompt[:200],
             )
             return "죄송합니다. 요청 처리 중 오류가 발생했습니다."
 
-        stdout_text = stdout_bytes.decode("utf-8", errors="replace").strip()
-        return self._parse_response(stdout_text)
+        return self._parse_stream_response(lines)
 
     @staticmethod
-    def _parse_response(raw: str) -> str:
-        """Extract the response text from JSON output, or return raw text."""
-        try:
-            data = json.loads(raw)
-            if isinstance(data, dict) and "result" in data:
-                return data["result"]
-            return raw
-        except (json.JSONDecodeError, KeyError):
-            return raw
+    def _parse_stream_response(lines: list[str]) -> str:
+        """Extract the final result text from stream-json output.
+
+        ``stream-json`` emits one JSON object per line.  The final message
+        with ``"type": "result"`` contains the ``"result"`` field we need.
+        Falls back to collecting all ``assistant`` message text blocks.
+        """
+        result_text: str | None = None
+        text_parts: list[str] = []
+
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            # The final "result" event carries the complete answer.
+            if event.get("type") == "result":
+                result_text = event.get("result", "")
+                break
+
+            # Accumulate assistant text blocks as fallback.
+            if event.get("type") == "assistant" and "message" in event:
+                for block in event["message"].get("content", []):
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        text_parts.append(block["text"])
+
+        if result_text is not None:
+            return result_text
+        if text_parts:
+            return "\n\n".join(text_parts)
+        # Last resort: return raw concatenation.
+        return "".join(lines).strip()
 
     async def _build_thread_prompt(self, channel: str, thread_ts: str) -> str:
         """Fetch Slack thread history and format as a conversation prompt."""

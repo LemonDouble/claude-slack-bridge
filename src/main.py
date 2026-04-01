@@ -35,6 +35,7 @@ async def run(config: Config) -> None:
     daemon = SlackDaemon(
         bot_token=config.slack_bot_token,
         app_token=config.slack_app_token,
+        idle_timeout_minutes=config.timeout_limit_minutes,
     )
     logger.info("Starting Claude <-> Slack Daemon.")
     await daemon.start()

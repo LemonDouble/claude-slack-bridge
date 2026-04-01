@@ -126,7 +126,7 @@ Once you use `mcp__claude-slack-bridge__ask_on_slack` for the first time in a co
 | 변수 | 필수 | 기본값 | 설명 |
 |---|---|---|---|
 | `SLACK_CHANNEL` | Yes | — | 대상 채널 이름 또는 ID (예: `#my-project`) |
-| `TIMEOUT_LIMIT_MINUTES` | No | `5` | 타임아웃까지 대기 시간(분) |
+| `TIMEOUT_LIMIT_MINUTES` | No | `720` | Idle 타임아웃 대기 시간(분). 기본 12시간. |
 
 프로젝트마다 `SLACK_CHANNEL`을 설정하여 각 프로젝트가 전용 채널에 메시지를 게시하도록 합니다.
 
@@ -138,13 +138,37 @@ Claude가 컨텍스트만으로는 해결할 수 없는 결정이 필요할 때 
 
 **입력:** `message` — 보낼 질문 또는 메시지
 **출력:** 답변 텍스트
-**타임아웃:** `TIMEOUT_LIMIT_MINUTES` 내에 답변이 없으면 에러 발생
+**타임아웃:** `TIMEOUT_LIMIT_MINUTES` 내에 답변이 없으면 에러 발생 (기본 12시간)
 
 > **스레드에서 답변하세요.** Slack에 메시지가 나타나면 **답변(Reply)**을 클릭하여 스레드를 열고 답변을 입력하세요. 채널에 직접 보낸 메시지는 인식되지 않습니다.
 
 명시적으로 Claude에게 요청할 수도 있습니다:
 
 > *"기존 파일을 덮어쓸지 Slack에서 물어봐."*
+
+---
+
+## 실시간 진행 상황 표시
+
+Slack → Claude 방향에서 Claude가 작업 중일 때, 스레드에 실시간 진행 상황이 표시됩니다.
+
+- Claude의 `stream-json` 출력을 파싱하여 도구 사용 이벤트를 실시간으로 Slack 스레드에 포스트합니다.
+- 하나의 메시지를 계속 업데이트하는 방식으로 스레드를 깔끔하게 유지합니다 (3초 간격 throttle).
+- 작업 완료 시 진행 상황 메시지는 삭제되고 최종 결과만 남습니다.
+
+표시 예시:
+```
+🚀 세션 시작 (a1b2c3d4…)
+🖥️ $ python train.py --epochs 100
+📄 Read /src/model.py
+✏️ Edit /src/config.py
+🔍 Grep "learning_rate"
+🤖 Agent research ML papers
+```
+
+### Idle 타임아웃
+
+기존의 전체 시간 제한 대신 **idle 타임아웃**을 사용합니다. Claude가 출력을 생성하는 한 시간 제한 없이 계속 실행됩니다. 마지막 출력 이후 `TIMEOUT_LIMIT_MINUTES` 동안 아무 출력이 없을 때만 타임아웃이 발생합니다. 기본값은 12시간(720분)으로, ML 학습 등 장시간 작업에 적합합니다.
 
 ---
 

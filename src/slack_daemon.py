@@ -21,6 +21,7 @@ import asyncio
 import logging
 import os
 import re
+import time
 from typing import Any
 
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
@@ -45,12 +46,15 @@ class SlackDaemon:
         app_token: Slack app-level token for Socket Mode (xapp-...).
     """
 
-    def __init__(self, bot_token: str, app_token: str) -> None:
+    def __init__(self, bot_token: str, app_token: str, idle_timeout_minutes: int = 30) -> None:
         self._app = AsyncApp(token=bot_token)
         self._handler = AsyncSocketModeHandler(self._app, app_token)
         self._pending: dict[str, asyncio.StreamWriter] = {}
         self._lock = asyncio.Lock()
-        self._claude = ClaudeHandler(slack_client=self._app.client)
+        self._claude = ClaudeHandler(
+            slack_client=self._app.client,
+            idle_timeout_minutes=idle_timeout_minutes,
+        )
         self._active_threads: set[str] = set()
         self._bot_user_id: str = ""
 
@@ -325,12 +329,24 @@ class SlackDaemon:
         except Exception as exc:
             logger.warning("Failed to remove reaction %s: %s", name, exc)
 
+    # ------------------------------------------------------------------
+    # Stream event formatting
+    # ------------------------------------------------------------------
+
+    def _make_event_poster(self, channel: str, thread_ts: str) -> "EventPoster":
+        """Create an EventPoster that formats and posts Claude stream events."""
+        return EventPoster(self._app.client, channel, thread_ts)
+
     async def _handle_claude_new_message(self, channel: str, message_ts: str, text: str) -> None:
         """Spawn Claude for a new top-level message and post the response as a thread reply."""
         self._active_threads.add(message_ts)
         await self._add_reaction(channel, message_ts, "hourglass_flowing_sand")
+        poster = self._make_event_poster(channel, message_ts)
         try:
-            response = await self._claude.handle_message(channel, message_ts, text)
+            response = await self._claude.handle_message(
+                channel, message_ts, text, on_event=poster.handle_event,
+            )
+            await poster.flush()
             await self._post_response(channel, message_ts, response)
             await self._remove_reaction(channel, message_ts, "hourglass_flowing_sand")
             await self._add_reaction(channel, message_ts, "white_check_mark")
@@ -347,8 +363,12 @@ class SlackDaemon:
         logger.info("Handling thread reply: thread=%s, react_ts=%s, channel=%s", thread_ts, react_ts, channel)
         self._active_threads.add(thread_ts)
         await self._add_reaction(channel, react_ts, "hourglass_flowing_sand")
+        poster = self._make_event_poster(channel, thread_ts)
         try:
-            response = await self._claude.handle_thread_reply(channel, thread_ts, text)
+            response = await self._claude.handle_thread_reply(
+                channel, thread_ts, text, on_event=poster.handle_event,
+            )
+            await poster.flush()
             await self._post_response(channel, thread_ts, response)
             await self._remove_reaction(channel, react_ts, "hourglass_flowing_sand")
             await self._add_reaction(channel, react_ts, "white_check_mark")
@@ -488,3 +508,136 @@ class SlackDaemon:
                 server.serve_forever(),
                 self._handler.start_async(),
             )
+
+
+# ======================================================================
+# EventPoster — formats stream-json events and posts progress to Slack
+# ======================================================================
+
+# Minimum interval between Slack progress posts (seconds).
+_POST_INTERVAL = 3.0
+
+
+class EventPoster:
+    """Accumulates Claude stream-json events and posts formatted progress to a Slack thread.
+
+    Batches events to stay within Slack rate limits (~1 msg/sec) and updates
+    a single "progress" message instead of spamming many messages.
+    """
+
+    def __init__(self, slack_client: Any, channel: str, thread_ts: str) -> None:
+        self._client = slack_client
+        self._channel = channel
+        self._thread_ts = thread_ts
+        self._progress_ts: str | None = None  # ts of the live progress message
+        self._lines: list[str] = []           # accumulated progress lines
+        self._last_post: float = 0.0
+        self._dirty = False
+
+    async def handle_event(self, event: dict[str, Any]) -> None:
+        """Process a single stream-json event."""
+        line = self._format_event(event)
+        if line is None:
+            return
+
+        self._lines.append(line)
+        self._dirty = True
+
+        # Throttle: only post/update every _POST_INTERVAL seconds.
+        now = time.monotonic()
+        if now - self._last_post >= _POST_INTERVAL:
+            await self._post_or_update()
+
+    async def flush(self) -> None:
+        """Post any remaining buffered progress and finalize the message."""
+        if self._dirty:
+            await self._post_or_update()
+        # Delete the progress message — the final result will be posted separately.
+        if self._progress_ts:
+            try:
+                await self._client.chat_delete(
+                    channel=self._channel, ts=self._progress_ts,
+                )
+            except Exception:
+                pass  # Best effort — might lack permission.
+
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _format_event(event: dict[str, Any]) -> str | None:
+        """Return a single formatted line for an event, or None to skip."""
+        etype = event.get("type")
+
+        # --- assistant message: extract tool_use blocks ---
+        if etype == "assistant":
+            content = event.get("message", {}).get("content", [])
+            parts: list[str] = []
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "tool_use":
+                    parts.append(_format_tool_use(block))
+            return "\n".join(parts) if parts else None
+
+        # --- system init ---
+        if etype == "system" and event.get("subtype") == "init":
+            session_id = event.get("session_id", "")[:8]
+            return f":rocket:  세션 시작 (`{session_id}…`)"
+
+        # Skip result (handled separately) and other noise.
+        return None
+
+    async def _post_or_update(self) -> None:
+        """Post a new progress message or update the existing one."""
+        # Keep the last 30 lines to stay within Slack message limits.
+        visible = self._lines[-30:]
+        text = "\n".join(visible)
+        if not text:
+            return
+
+        try:
+            if self._progress_ts:
+                await self._client.chat_update(
+                    channel=self._channel, ts=self._progress_ts, text=text, mrkdwn=True,
+                )
+            else:
+                resp = await self._client.chat_postMessage(
+                    channel=self._channel, thread_ts=self._thread_ts, text=text, mrkdwn=True,
+                )
+                self._progress_ts = resp["ts"]
+        except Exception as exc:
+            logger.warning("EventPoster post/update failed: %s", exc)
+
+        self._last_post = time.monotonic()
+        self._dirty = False
+
+
+def _format_tool_use(block: dict[str, Any]) -> str:
+    """Format a tool_use content block into a readable Slack line."""
+    name = block.get("name", "unknown")
+    inp = block.get("input", {})
+
+    if name == "Bash":
+        cmd = inp.get("command", "")
+        display = cmd if len(cmd) <= 120 else cmd[:117] + "…"
+        return f":terminal:  `$ {display}`"
+
+    if name in ("Read", "Glob"):
+        path = inp.get("file_path") or inp.get("pattern", "")
+        return f":page_facing_up:  *{name}* `{path}`"
+
+    if name in ("Edit", "Write"):
+        path = inp.get("file_path", "")
+        return f":pencil2:  *{name}* `{path}`"
+
+    if name == "Grep":
+        pattern = inp.get("pattern", "")
+        return f":mag:  *Grep* `{pattern}`"
+
+    if name in ("Agent", "agent"):
+        desc = inp.get("description") or inp.get("prompt", "")[:60]
+        return f":robot_face:  *Agent* {desc}"
+
+    # Generic fallback
+    summary = str(inp)[:80]
+    return f":hammer_and_wrench:  *{name}* {summary}"

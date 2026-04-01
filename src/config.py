@@ -21,6 +21,6 @@ class Config(BaseSettings):
     slack_bot_token: str
     slack_app_token: str
     slack_channel: str = ""  # Not used by daemon; overridden per-session via docker exec -e
-    timeout_limit_minutes: int = 5
+    timeout_limit_minutes: int = 720
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
