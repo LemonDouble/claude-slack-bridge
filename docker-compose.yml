@@ -14,7 +14,7 @@ services:
       - ${HOME}/.claude/.credentials.json:/home/appuser/.claude/.credentials.json:ro
       # Mount all projects so claude -p can run from the correct project directory
       - ${PROJECTS_DIR}:/projects
+    restart: unless-stopped
 
 volumes:
   claude-data:
-    restart: unless-stopped
