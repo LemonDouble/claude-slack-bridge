@@ -134,7 +134,10 @@ class ClaudeHandler:
 
         project_dir = self._thread_projects.get(message_ts)
         cmd = self._build_cmd(session_id=session_id)
-        return await self._run_claude(cmd, text, cwd=project_dir, on_event=on_event)
+        return await self._run_claude(
+            cmd, text, cwd=project_dir, on_event=on_event,
+            slack_channel=channel, slack_thread_ts=message_ts,
+        )
 
     async def handle_thread_reply(
         self, channel: str, thread_ts: str, text: str,
@@ -147,13 +150,19 @@ class ClaudeHandler:
         if session_id:
             logger.info("Resuming session %s for thread %s", session_id, thread_ts)
             cmd = self._build_cmd(resume=session_id)
-            return await self._run_claude(cmd, text, cwd=project_dir, on_event=on_event)
+            return await self._run_claude(
+                cmd, text, cwd=project_dir, on_event=on_event,
+                slack_channel=channel, slack_thread_ts=thread_ts,
+            )
 
         # Fallback: session lost (container restart) — use thread history as context.
         logger.info("No session for thread %s, falling back to thread history.", thread_ts)
         prompt = await self._build_thread_prompt(channel, thread_ts)
         cmd = self._build_cmd()
-        return await self._run_claude(cmd, prompt, cwd=project_dir, on_event=on_event)
+        return await self._run_claude(
+            cmd, prompt, cwd=project_dir, on_event=on_event,
+            slack_channel=channel, slack_thread_ts=thread_ts,
+        )
 
     # ------------------------------------------------------------------
     # Internals
@@ -174,6 +183,7 @@ class ClaudeHandler:
     async def _run_claude(
         self, cmd: list[str], prompt: str, cwd: str | None = None,
         on_event: OnEventFn | None = None,
+        slack_channel: str = "", slack_thread_ts: str = "",
     ) -> str:
         """Spawn a ``claude -p`` subprocess and return the response text.
 
@@ -187,6 +197,10 @@ class ClaudeHandler:
         """
         env = os.environ.copy()
         env.pop("CLAUDECODE", None)
+        if slack_channel:
+            env["SLACK_CHANNEL"] = slack_channel
+        if slack_thread_ts:
+            env["SLACK_THREAD_TS"] = slack_thread_ts
 
         try:
             process = await asyncio.create_subprocess_exec(

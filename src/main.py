@@ -13,6 +13,7 @@ receive the reply when it arrives — no polling, OS-level blocking I/O.
 """
 
 import asyncio
+import json
 import logging
 import time
 from pathlib import Path
@@ -21,6 +22,7 @@ from config import Config
 from slack_daemon import SlackDaemon
 
 SESSION_MAX_AGE_DAYS = 7
+CLAUDE_SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -67,7 +69,29 @@ def cleanup_old_sessions() -> None:
         logger.info("Cleaned up %d session files older than %d days.", removed, SESSION_MAX_AGE_DAYS)
 
 
+def ensure_claude_settings() -> None:
+    """Write Claude settings.json so that claude -p can use MCP tools."""
+    settings: dict = {}
+    if CLAUDE_SETTINGS_PATH.exists():
+        try:
+            settings = json.loads(CLAUDE_SETTINGS_PATH.read_text())
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    settings["mcpServers"] = {
+        "slack-tools": {
+            "command": "python",
+            "args": ["/app/src/tools_mcp.py"],
+        },
+    }
+
+    CLAUDE_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CLAUDE_SETTINGS_PATH.write_text(json.dumps(settings, indent=2))
+    logger.info("Wrote Claude settings with slack-tools MCP to %s", CLAUDE_SETTINGS_PATH)
+
+
 if __name__ == "__main__":
     cfg = Config()  # type: ignore[call-arg]
     cleanup_old_sessions()
+    ensure_claude_settings()
     asyncio.run(run(cfg))
