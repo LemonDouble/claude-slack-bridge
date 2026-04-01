@@ -173,7 +173,21 @@ class ClaudeHandler:
         session_id: str | None = None,
         resume: str | None = None,
     ) -> list[str]:
-        cmd = ["claude", "-p", "--dangerously-skip-permissions", "--verbose", "--output-format", "stream-json"]
+        mcp_config = json.dumps({
+            "mcpServers": {
+                "slack-tools": {
+                    "command": "python",
+                    "args": ["/app/src/tools_mcp.py"],
+                }
+            }
+        })
+        cmd = [
+            "claude", "-p",
+            "--dangerously-skip-permissions",
+            "--verbose",
+            "--output-format", "stream-json",
+            "--mcp-config", mcp_config,
+        ]
         if session_id:
             cmd.extend(["--session-id", session_id])
         if resume:
