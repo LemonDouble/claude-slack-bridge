@@ -56,7 +56,11 @@ async def run(config: Config) -> None:
         post_message=post_message,
         timeout_minutes=config.timeout_limit_minutes,
     )
-    mcp_server = MCPServer(broker=broker)
+    mcp_server = MCPServer(
+        broker=broker,
+        slack_client=app.client,
+        channel=config.slack_channel,
+    )
     mcp = FastMCP(name="ClaudeSlackBridge")
     mcp_server.register(mcp)
 
