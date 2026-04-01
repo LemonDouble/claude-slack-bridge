@@ -11,7 +11,7 @@ services:
       # Persist Claude CLI session data across container restarts
       - claude-data:/home/appuser/.claude
       # Mount Claude CLI credentials (read-only)
-      - ${HOME}/.claude/.credentials.json:/home/appuser/.claude/.credentials.json:ro
+      - ${HOME}/.claude/.credentials.json:/home/appuser/.claude/.credentials.json
       # Mount all projects so claude -p can run from the correct project directory
       - ${PROJECTS_DIR}:/projects
     restart: unless-stopped
