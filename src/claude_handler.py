@@ -164,7 +164,7 @@ class ClaudeHandler:
         session_id: str | None = None,
         resume: str | None = None,
     ) -> list[str]:
-        cmd = ["claude", "-p", "--dangerously-skip-permissions", "--output-format", "stream-json"]
+        cmd = ["claude", "-p", "--dangerously-skip-permissions", "--verbose", "--output-format", "stream-json"]
         if session_id:
             cmd.extend(["--session-id", session_id])
         if resume:
