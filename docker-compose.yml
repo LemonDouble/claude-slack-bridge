@@ -14,6 +14,13 @@ services:
       - ${HOME}/.claude/.credentials.json:/home/appuser/.claude/.credentials.json
       # Mount all projects so claude -p can run from the correct project directory
       - ${PROJECTS_DIR}:/projects
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
     restart: unless-stopped
 
 volumes:

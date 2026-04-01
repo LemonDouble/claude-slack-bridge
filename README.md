@@ -276,7 +276,6 @@ claude-slack-bridge/
 │   └── mcp-client-setup.md   # Claude Code 프로젝트에 .mcp.json 설정 방법
 ├── Dockerfile
 ├── docker-compose.yml
-├── docker-compose.gpu.yml  # GPU 사용 시 override 파일
 └── requirements.txt
 ```
 
@@ -300,9 +299,9 @@ claude-slack-bridge/
 - Slack 앱을 생성할 수 있는 Slack 워크스페이스
 - Claude Code (또는 MCP 호환 클라이언트)
 
-### (선택) GPU 사용
+### GPU 사용
 
-컨테이너 내에서 GPU를 사용하려면(ML 학습 등) 호스트에 NVIDIA Container Toolkit을 설치해야 합니다.
+기본 설정에 GPU 지원이 포함되어 있습니다. 컨테이너 내에서 GPU를 사용하려면(ML 학습 등) 호스트에 NVIDIA Container Toolkit을 설치해야 합니다.
 
 #### 사전 조건
 
@@ -335,17 +334,9 @@ sudo systemctl restart docker
 docker run --rm --gpus all nvidia/cuda:12.6.3-base-ubuntu24.04 nvidia-smi
 ```
 
-정상적으로 GPU 정보가 출력되면 설정 완료입니다.
+정상적으로 GPU 정보가 출력되면 설정 완료입니다. 이후 `docker compose up -d --build`로 실행하면 GPU가 자동으로 사용됩니다.
 
-#### 3. GPU 모드로 실행
-
-GPU override 파일을 함께 지정하여 실행합니다:
-
-```bash
-docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build
-```
-
-> **참고:** GPU가 없는 환경에서는 기본 `docker compose up -d --build`로 실행하면 됩니다 — GPU 설정은 별도 override 파일(`docker-compose.gpu.yml`)로 분리되어 있어 기본 동작에 영향을 주지 않습니다.
+> **참고:** GPU가 없는 환경에서도 `docker compose up -d --build`로 정상 실행됩니다 — `deploy.resources.reservations`는 GPU가 없으면 무시됩니다.
 
 ---
 
