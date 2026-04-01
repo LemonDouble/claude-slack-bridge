@@ -196,6 +196,7 @@ class ClaudeHandler:
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
                 cwd=cwd,
+                limit=10 * 1024 * 1024,  # 10 MB readline buffer
             )
         except FileNotFoundError:
             logger.error("claude CLI not found — is it installed and in PATH?")

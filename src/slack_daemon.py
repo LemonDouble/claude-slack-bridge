@@ -354,6 +354,7 @@ class SlackDaemon:
             logger.error("Error handling top-level message %s: %s", message_ts, exc)
             await self._remove_reaction(channel, message_ts, "hourglass_flowing_sand")
             await self._add_reaction(channel, message_ts, "x")
+            await self._post_error(channel, message_ts, exc)
         finally:
             self._active_threads.discard(message_ts)
 
@@ -376,8 +377,23 @@ class SlackDaemon:
             logger.error("Error in thread continuation %s: %s", thread_ts, exc)
             await self._remove_reaction(channel, react_ts, "hourglass_flowing_sand")
             await self._add_reaction(channel, react_ts, "x")
+            await self._post_error(channel, thread_ts, exc)
         finally:
             self._active_threads.discard(thread_ts)
+
+    async def _post_error(self, channel: str, thread_ts: str, exc: Exception) -> None:
+        """Post an error summary to the Slack thread so the user knows what went wrong."""
+        error_type = type(exc).__name__
+        error_msg = str(exc)
+        if len(error_msg) > 500:
+            error_msg = error_msg[:497] + "…"
+        text = f":warning: *오류가 발생했습니다*\n`{error_type}: {error_msg}`"
+        try:
+            await self._app.client.chat_postMessage(
+                channel=channel, thread_ts=thread_ts, text=text, mrkdwn=True,
+            )
+        except Exception as post_exc:
+            logger.warning("Failed to post error message: %s", post_exc)
 
     @staticmethod
     def _markdown_to_slack(text: str) -> str:
