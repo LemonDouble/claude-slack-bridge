@@ -272,6 +272,7 @@ claude-slack-bridge/
 │   └── mcp-client-setup.md   # Claude Code 프로젝트에 .mcp.json 설정 방법
 ├── Dockerfile
 ├── docker-compose.yml
+├── docker-compose.gpu.yml  # GPU 사용 시 override 파일
 └── requirements.txt
 ```
 
@@ -294,6 +295,53 @@ claude-slack-bridge/
 - Docker (Docker Compose 포함)
 - Slack 앱을 생성할 수 있는 Slack 워크스페이스
 - Claude Code (또는 MCP 호환 클라이언트)
+
+### (선택) GPU 사용
+
+컨테이너 내에서 GPU를 사용하려면(ML 학습 등) 호스트에 NVIDIA Container Toolkit을 설치해야 합니다.
+
+#### 사전 조건
+
+- NVIDIA GPU가 장착된 머신
+- NVIDIA GPU 드라이버 설치 완료 (`nvidia-smi`로 확인)
+  - WSL2 환경: **Windows 측**에 NVIDIA 드라이버를 설치하면 WSL2에서 자동으로 사용 가능
+
+#### 1. NVIDIA Container Toolkit 설치
+
+```bash
+# GPG 키 및 저장소 추가
+curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
+  sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
+  sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+
+# 설치
+sudo apt-get update
+sudo apt-get install -y nvidia-container-toolkit
+
+# Docker 런타임에 등록 및 재시작
+sudo nvidia-ctk runtime configure --runtime=docker
+sudo systemctl restart docker
+```
+
+#### 2. 설치 확인
+
+```bash
+# Docker에서 GPU 접근 가능한지 확인
+docker run --rm --gpus all nvidia/cuda:12.6.3-base-ubuntu24.04 nvidia-smi
+```
+
+정상적으로 GPU 정보가 출력되면 설정 완료입니다.
+
+#### 3. GPU 모드로 실행
+
+GPU override 파일을 함께 지정하여 실행합니다:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build
+```
+
+> **참고:** GPU가 없는 환경에서는 기본 `docker compose up -d --build`로 실행하면 됩니다 — GPU 설정은 별도 override 파일(`docker-compose.gpu.yml`)로 분리되어 있어 기본 동작에 영향을 주지 않습니다.
 
 ---
 
