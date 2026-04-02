@@ -169,7 +169,7 @@ class MCPServer:
             path = await download_file_by_id(
                 file_id=file_id,
                 bot_token=self._slack_client.token,
-                dest_dir=PROJECTS_ROOT,
+                dest_dir=Path.cwd(),
             )
             return str(path)
         except Exception as exc:
