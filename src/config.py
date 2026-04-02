@@ -5,6 +5,8 @@ Loads and validates all required environment variables using pydantic-settings.
 This is the single source of truth for settings throughout the application.
 """
 
+from pathlib import Path
+
 from pydantic_settings import BaseSettings
 
 
@@ -22,5 +24,9 @@ class Config(BaseSettings):
     slack_app_token: str
     slack_channel: str = ""  # Not used by daemon; overridden per-session via docker exec -e
     timeout_limit_minutes: int = 720
+    projects_dir: str = "/home/lemon/claude-projects"
 
-    model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
+    model_config = {
+        "env_file": str(Path(__file__).resolve().parent.parent / ".env"),
+        "env_file_encoding": "utf-8",
+    }

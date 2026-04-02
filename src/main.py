@@ -78,11 +78,12 @@ def ensure_claude_settings() -> None:
         except (json.JSONDecodeError, OSError):
             pass
 
-    settings["mcpServers"] = {
-        "slack-tools": {
-            "command": "python",
-            "args": ["/app/src/tools_mcp.py"],
-        },
+    tools_mcp_path = str(Path(__file__).resolve().parent / "tools_mcp.py")
+    if "mcpServers" not in settings:
+        settings["mcpServers"] = {}
+    settings["mcpServers"]["slack-tools"] = {
+        "command": "python",
+        "args": [tools_mcp_path],
     }
 
     CLAUDE_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)

@@ -1,4 +1,0 @@
-fastmcp
-slack-bolt[async]
-aiohttp
-pydantic-settings

@@ -29,7 +29,7 @@ OnEventFn = Callable[[dict[str, Any]], Coroutine[Any, Any, None]]
 logger = logging.getLogger(__name__)
 
 DEFAULT_IDLE_TIMEOUT = 43200  # 12 hours
-PROJECTS_ROOT = Path("/projects")
+PROJECTS_ROOT = Path(os.environ.get("PROJECTS_DIR", "/home/lemon/claude-projects"))
 
 
 class ClaudeHandler:
@@ -177,7 +177,7 @@ class ClaudeHandler:
             "mcpServers": {
                 "slack-tools": {
                     "command": "python",
-                    "args": ["/app/src/tools_mcp.py"],
+                    "args": [str(Path(__file__).resolve().parent / "tools_mcp.py")],
                 }
             }
         })
