@@ -22,7 +22,7 @@ class Config(BaseSettings):
 
     slack_bot_token: str
     slack_app_token: str
-    slack_channel: str = ""  # Not used by daemon; overridden per-session via docker exec -e
+    slack_channel: str = ""  # Not used by daemon; overridden per-session
     timeout_limit_minutes: int = 720
     projects_dir: str = "/home/lemon/claude-projects"
 

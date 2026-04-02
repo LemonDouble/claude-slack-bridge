@@ -1,5 +1,5 @@
 """
-tools_mcp.py — Lightweight MCP server for container-side claude -p.
+tools_mcp.py — Lightweight MCP server for claude -p invocations.
 
 Provides ``notify_on_slack`` and ``upload_to_slack`` tools so that the
 Slack→Claude direction can send notifications and upload files without
@@ -13,6 +13,9 @@ import logging
 import os
 from pathlib import Path
 
+from dotenv import load_dotenv
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+
 from fastmcp import FastMCP
 from slack_sdk.web.async_client import AsyncWebClient
 
@@ -22,7 +25,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-PROJECTS_ROOT = Path("/projects")
+PROJECTS_ROOT = Path(os.environ.get("PROJECTS_DIR", "/home/lemon/claude-projects"))
 
 mcp = FastMCP(name="SlackTools")
 _client: AsyncWebClient | None = None
@@ -75,11 +78,11 @@ async def upload_to_slack(file_path: str, message: str = "") -> str:
     Upload a file to the Slack thread.
 
     Use this to share files with the user — training graphs, logs, CSVs,
-    images, generated code, etc. The file must be inside the /projects/
+    images, generated code, etc. The file must be inside the PROJECTS_DIR
     directory.
 
     Args:
-        file_path: Absolute path to the file to upload (must be under /projects/).
+        file_path: Absolute path to the file to upload (must be under PROJECTS_DIR).
         message:   Optional comment to post alongside the file.
 
     Returns:
@@ -96,7 +99,7 @@ async def upload_to_slack(file_path: str, message: str = "") -> str:
     try:
         path.resolve().relative_to(PROJECTS_ROOT.resolve())
     except ValueError:
-        return f"오류: /projects/ 디렉토리 밖의 파일은 업로드할 수 없습니다. (요청: {file_path})"
+        return f"오류: PROJECTS_DIR 디렉토리 밖의 파일은 업로드할 수 없습니다. (요청: {file_path})"
 
     if not path.exists():
         return f"오류: 파일을 찾을 수 없습니다. ({file_path})"

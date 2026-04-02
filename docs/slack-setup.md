@@ -1,104 +1,99 @@
-# Slack Setup — Getting Your Tokens
+# Slack 앱 설정 가이드
 
-## Step 1 — Create a Slack App
+## 1단계 — Slack 앱 생성
 
-1. Go to https://api.slack.com/apps
-2. Click **Create New App** → **From scratch**
-3. Name it (e.g. `claude-bridge`)
-4. Select your workspace
-5. Click **Create App**
+1. https://api.slack.com/apps 접속
+2. **Create New App** → **From scratch** 클릭
+3. 앱 이름 입력 (예: `claude-bridge`)
+4. 워크스페이스 선택
+5. **Create App** 클릭
 
 ---
 
-## Step 2 — Get the Bot Token (`xoxb-...`)
+## 2단계 — Bot 토큰 발급 (`xoxb-...`)
 
-1. In your app's left sidebar, go to **OAuth & Permissions**
-2. Scroll down to **Bot Token Scopes** and add these scopes:
+1. 좌측 사이드바에서 **OAuth & Permissions** 클릭
+2. **Bot Token Scopes**에서 아래 스코프 추가:
 
-   | Scope | Purpose |
+   | 스코프 | 용도 |
    |---|---|
-   | `chat:write` | Post messages |
-   | `channels:history` | Read replies in public channels |
-   | `groups:history` | Read replies in private channels |
-   | `im:history` | Read replies in DMs |
-   | `im:write` | Open DM conversations |
+   | `chat:write` | 메시지 전송 |
+   | `channels:history` | 공개 채널 답변 읽기 |
+   | `groups:history` | 비공개 채널 답변 읽기 |
+   | `im:history` | DM 답변 읽기 |
+   | `im:write` | DM 대화 열기 |
+   | `files:write` | 파일 업로드 |
 
-3. Scroll back up and click **Install to Workspace**
-4. Click **Allow**
-5. Copy the **Bot User OAuth Token** — it starts with `xoxb-...`
-
----
-
-## Step 3 — Enable Socket Mode & Get the App Token (`xapp-...`)
-
-1. In the left sidebar, go to **Socket Mode**
-2. Toggle **Enable Socket Mode** → ON
-3. It will prompt you to create an App-Level Token — click **Generate Token and Scopes** (or go to **Settings → Basic Information** → scroll to **App-Level Tokens**)
-4. Name the token (e.g. `socket-mode`)
-5. Add scope: `connections:write`
-6. Click **Generate**
-7. Copy the token — it starts with `xapp-...`
+3. 상단으로 스크롤 → **Install to Workspace** 클릭
+4. **Allow** 클릭
+5. **Bot User OAuth Token** 복사 (`xoxb-...`로 시작)
 
 ---
 
-## Step 4 — Enable Event Subscriptions
+## 3단계 — Socket Mode 활성화 및 App 토큰 발급 (`xapp-...`)
 
-1. In the left sidebar, go to **Event Subscriptions**
-2. Toggle **Enable Events** → ON
-3. Under **Subscribe to bot events**, add:
-   - `message.channels` — messages in public channels
-   - `message.groups` — messages in private channels
-   - `message.im` — messages in DMs
-4. Click **Save Changes**
-5. Reinstall the app if prompted (**OAuth & Permissions** → **Reinstall to Workspace**)
-
----
-
-## Step 5 — Create a Channel per Project
-
-1. In Slack, click **+** next to Channels → **Create channel**
-2. Name it after the project (e.g. `vibki`, `resume-fitter`)
-3. Click **Create**
-4. Use the channel name as `SLACK_CHANNEL` (e.g. `#vibki`)
+1. 좌측 사이드바에서 **Socket Mode** 클릭
+2. **Enable Socket Mode** → ON
+3. App-Level Token 생성 프롬프트가 나타남 → 또는 **Settings → Basic Information → App-Level Tokens**로 이동
+4. 토큰 이름 입력 (예: `socket-mode`)
+5. 스코프 추가: `connections:write`
+6. **Generate** 클릭
+7. 토큰 복사 (`xapp-...`로 시작)
 
 ---
 
-## Step 6 — Invite the Bot to Your Channel
+## 4단계 — Event Subscriptions 활성화
 
-In each project channel:
-1. Click the channel name at the top to open its settings
-2. Go to the chat apps to this channel
-3. Search for your app and click **Add**
-
----
-
-## Changing the App Name
-
-The app name and the bot's display name are separate settings.
-
-### Change the App Name
-1. Go to https://api.slack.com/apps and select your app
-2. In the left sidebar, go to **Settings → Basic Information**
-3. Update the **App Name** field at the top
-4. Click **Save Changes**
-
-### Change the Bot's Display Name (what Slack shows)
-1. In the left sidebar, go to **App Home**
-2. Under **Your App's Presence in Slack**, click **Edit** next to the display name
-3. Update it and save
-
-### Apply the Changes
-After renaming, reinstall the app:
-1. Go to **OAuth & Permissions**
-2. Click **Reinstall to Workspace**
-3. Click **Allow**
+1. 좌측 사이드바에서 **Event Subscriptions** 클릭
+2. **Enable Events** → ON
+3. **Subscribe to bot events**에서 추가:
+   - `message.channels` — 공개 채널 메시지
+   - `message.groups` — 비공개 채널 메시지
+   - `message.im` — DM 메시지
+4. **Save Changes** 클릭
+5. 프롬프트가 나타나면 앱 재설치 (**OAuth & Permissions** → **Reinstall to Workspace**)
 
 ---
 
-## Summary — What You Have Now
+## 5단계 — Interactivity 활성화
 
-| Variable | Value | Where to set |
+Slack → Claude 방향의 프로젝트 선택 UI(Block Kit 버튼, 모달)를 사용하려면 활성화 필요합니다.
+
+1. 좌측 사이드바에서 **Interactivity & Shortcuts** 클릭
+2. **Interactivity** → ON
+3. Socket Mode가 페이로드를 처리하므로 Request URL은 필요 없음 — 토글만 켜면 됩니다
+4. **Save Changes** 클릭
+
+---
+
+## 6단계 — 채널 생성 및 봇 초대
+
+1. Slack에서 **+** → **Create channel** 클릭
+2. 프로젝트에 맞는 이름 설정 (예: `chat-claude`)
+3. 채널 생성 후, 채널 설정에서 봇 앱을 추가
+
+---
+
+## 앱 이름 변경 (선택)
+
+### 앱 이름 변경
+1. https://api.slack.com/apps → 앱 선택
+2. **Settings → Basic Information**에서 **App Name** 수정
+3. **Save Changes**
+
+### 봇 표시 이름 변경
+1. **App Home** → **Your App's Presence in Slack** → **Edit** 클릭
+2. 표시 이름 수정 후 저장
+
+### 변경 적용
+앱 재설치 필요: **OAuth & Permissions** → **Reinstall to Workspace** → **Allow**
+
+---
+
+## 결과 요약
+
+| 변수 | 값 | 설정 위치 |
 |---|---|---|
-| `SLACK_BOT_TOKEN` | `xoxb-...` | Docker container (shared) |
-| `SLACK_APP_TOKEN` | `xapp-...` | Docker container (shared) |
-| `SLACK_CHANNEL` | `#channel-name` or `U0123456789` | Project MCP config (per project) |
+| `SLACK_BOT_TOKEN` | `xoxb-...` | `.env` |
+| `SLACK_APP_TOKEN` | `xapp-...` | `.env` |
+| `SLACK_CHANNEL` | `#채널이름` | MCP 설정 (프로젝트별) |

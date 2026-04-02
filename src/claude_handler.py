@@ -5,10 +5,10 @@ When a human posts a message in Slack, this handler runs ``claude -p`` to
 generate a response.  Thread continuations use ``--resume`` so Claude retains
 full context (tool use, reasoning) across messages in the same thread.
 
-If the session ID is lost (e.g. container restart), falls back to a one-shot
+If the session ID is lost (e.g. process restart), falls back to a one-shot
 ``claude -p`` with the formatted thread history as the prompt.
 
-Project detection: scans ``/projects/`` for 1-depth subdirectories.  Each
+Project detection: scans PROJECTS_DIR for 1-depth subdirectories.  Each
 subdirectory is treated as a separate project.  The project for each thread
 is selected via Slack Block Kit interactions and tracked per thread_ts.
 """
@@ -155,7 +155,7 @@ class ClaudeHandler:
                 slack_channel=channel, slack_thread_ts=thread_ts,
             )
 
-        # Fallback: session lost (container restart) — use thread history as context.
+        # Fallback: session lost (process restart) — use thread history as context.
         logger.info("No session for thread %s, falling back to thread history.", thread_ts)
         prompt = await self._build_thread_prompt(channel, thread_ts)
         cmd = self._build_cmd()

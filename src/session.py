@@ -1,10 +1,7 @@
 """
-session.py — Session entry point (docker exec target).
+session.py — Session entry point for Claude Code MCP.
 
-Each Claude Code session starts one instance of this process via:
-
-    docker exec -i -e SLACK_CHANNEL=#my-channel claude-slack-bridge python session.py
-
+Each Claude Code session starts one instance of this process.
 The process runs an MCP stdio server with the ``ask_on_slack`` tool.
 It posts messages to the channel in SLACK_CHANNEL and waits for replies
 via the daemon's Unix socket — zero polling, OS-level blocking.
@@ -32,8 +29,7 @@ async def run(config: Config) -> None:
     Wire the session components and run the MCP stdio server.
 
     Args:
-        config: Validated configuration (reads SLACK_CHANNEL from env,
-                overridden per-project via ``docker exec -e``).
+        config: Validated configuration (reads SLACK_CHANNEL from env).
     """
     app = AsyncApp(token=config.slack_bot_token)
 

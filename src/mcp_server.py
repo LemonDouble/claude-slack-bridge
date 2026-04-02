@@ -4,7 +4,7 @@ mcp_server.py — MCP server module.
 Registers MCP tools on a FastMCP instance:
   - ``ask_on_slack``    — post a message and wait for a reply (blocking)
   - ``notify_on_slack`` — post a notification without waiting (fire-and-forget)
-  - ``upload_to_slack`` — upload a file from /projects/ to the Slack thread
+  - ``upload_to_slack`` — upload a file from PROJECTS_DIR to the Slack thread
 """
 
 import logging
@@ -16,7 +16,7 @@ from fastmcp import FastMCP
 
 logger = logging.getLogger(__name__)
 
-PROJECTS_ROOT = Path("/projects")
+PROJECTS_ROOT = Path(os.environ.get("PROJECTS_DIR", "/home/lemon/claude-projects"))
 
 
 class MCPServer:
@@ -97,11 +97,11 @@ class MCPServer:
         Upload a file to the Slack thread.
 
         Use this to share files with the user — training graphs, logs, CSVs,
-        images, generated code, etc. The file must be inside the /projects/
+        images, generated code, etc. The file must be inside the PROJECTS_DIR
         directory.
 
         Args:
-            file_path: Absolute path to the file to upload (must be under /projects/).
+            file_path: Absolute path to the file to upload (must be under PROJECTS_DIR).
             message:   Optional comment to post alongside the file.
 
         Returns:
@@ -111,11 +111,11 @@ class MCPServer:
 
         path = Path(file_path)
 
-        # Security: only allow files under /projects/
+        # Security: only allow files under PROJECTS_DIR
         try:
             path.resolve().relative_to(PROJECTS_ROOT.resolve())
         except ValueError:
-            return f"오류: /projects/ 디렉토리 밖의 파일은 업로드할 수 없습니다. (요청: {file_path})"
+            return f"오류: PROJECTS_DIR 디렉토리 밖의 파일은 업로드할 수 없습니다. (요청: {file_path})"
 
         if not path.exists():
             return f"오류: 파일을 찾을 수 없습니다. ({file_path})"

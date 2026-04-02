@@ -2,7 +2,7 @@
 slack_daemon.py — Slack Socket Mode listener + Unix domain socket server.
 
 The daemon holds exactly one Socket Mode WebSocket connection to Slack and
-accepts local connections from session processes (started via docker exec).
+accepts local connections from session processes.
 
 Each session connects, sends ``REGISTER {thread_ts}\n``, and blocks. When a
 Slack reply arrives for that thread_ts the daemon forwards it over the socket,
@@ -13,7 +13,7 @@ messages (and threaded replies with no pending MCP session) are forwarded to
 the Claude Code CLI, and the response is posted back as a thread reply.
 
 Project selection: when a user mentions the bot, a Block Kit UI is shown
-with available projects (scanned from /projects/) and a "New Project" button.
+with available projects (scanned from PROJECTS_DIR) and a "New Project" button.
 Selecting a project starts a Claude thread in that project directory.
 """
 
