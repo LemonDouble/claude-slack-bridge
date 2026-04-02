@@ -22,6 +22,7 @@ import logging
 import os
 import re
 import time
+from collections import deque
 from typing import Any
 
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
@@ -57,6 +58,7 @@ class SlackDaemon:
             idle_timeout_minutes=idle_timeout_minutes,
         )
         self._active_threads: set[str] = set()
+        self._thread_queues: dict[str, deque] = {}
         self._bot_user_id: str = ""
 
         # Register event/action/view handlers
@@ -161,17 +163,31 @@ class SlackDaemon:
 
         # Case 2: Threaded reply with NO pending session — continue Claude conversation.
         if thread_ts:
-            if thread_ts in self._active_threads:
-                logger.info("Thread %s is active, skipping.", thread_ts)
-                return
             project = self._claude.get_thread_project(thread_ts)
             logger.info("Thread %s project lookup: %s (known projects: %s)",
                         thread_ts, project, list(self._claude._thread_projects.keys()))
-            if project:
-                message_ts = event.get("ts", thread_ts)
-                if files:
-                    text += format_file_metadata(files)
-                asyncio.create_task(self._handle_claude_thread_reply(channel, thread_ts, text, message_ts))
+            if not project:
+                return
+            message_ts = event.get("ts", thread_ts)
+            if files:
+                text += format_file_metadata(files)
+            if thread_ts in self._active_threads:
+                queue = self._thread_queues.setdefault(thread_ts, deque())
+                position = len(queue) + 1
+                logger.info("Thread %s is active, queuing message (#%d).", thread_ts, position)
+                await self._add_reaction(channel, message_ts, "eyes")
+                try:
+                    resp = await self._app.client.chat_postMessage(
+                        channel=channel, thread_ts=thread_ts,
+                        text=f":hourglass: 대기 중… (#{position})",
+                        mrkdwn=True,
+                    )
+                    status_ts = resp["ts"]
+                except Exception:
+                    status_ts = None
+                queue.append((channel, thread_ts, text, message_ts, status_ts))
+                return
+            asyncio.create_task(self._handle_claude_thread_reply(channel, thread_ts, text, message_ts))
             return
 
         # Case 3: Top-level message — only respond if the bot is mentioned.
@@ -358,8 +374,8 @@ class SlackDaemon:
             response = await self._claude.handle_message(
                 channel, message_ts, text, on_event=poster.handle_event,
             )
-            await poster.flush()
-            await self._post_response(channel, message_ts, response)
+            progress_ts = await poster.flush()
+            await self._post_response(channel, message_ts, response, progress_ts=progress_ts)
             await self._remove_reaction(channel, message_ts, "hourglass_flowing_sand")
             await self._add_reaction(channel, message_ts, "white_check_mark")
         except Exception as exc:
@@ -381,8 +397,8 @@ class SlackDaemon:
             response = await self._claude.handle_thread_reply(
                 channel, thread_ts, text, on_event=poster.handle_event,
             )
-            await poster.flush()
-            await self._post_response(channel, thread_ts, response)
+            progress_ts = await poster.flush()
+            await self._post_response(channel, thread_ts, response, progress_ts=progress_ts)
             await self._remove_reaction(channel, react_ts, "hourglass_flowing_sand")
             await self._add_reaction(channel, react_ts, "white_check_mark")
         except Exception as exc:
@@ -392,6 +408,28 @@ class SlackDaemon:
             await self._post_error(channel, thread_ts, exc)
         finally:
             self._active_threads.discard(thread_ts)
+            await self._process_thread_queue(thread_ts)
+
+    async def _process_thread_queue(self, thread_ts: str) -> None:
+        """Merge and process all queued messages for a thread."""
+        queue = self._thread_queues.pop(thread_ts, None)
+        if not queue:
+            return
+        channel = queue[0][0]
+        texts: list[str] = []
+        last_message_ts: str | None = None
+        for _ch, _ts, text, msg_ts, status_ts in queue:
+            texts.append(text)
+            last_message_ts = msg_ts
+            await self._remove_reaction(_ch, msg_ts, "eyes")
+            if status_ts:
+                try:
+                    await self._app.client.chat_delete(channel=_ch, ts=status_ts)
+                except Exception:
+                    pass
+        merged_text = "\n\n".join(texts)
+        logger.info("Processing %d merged queued messages for thread %s", len(texts), thread_ts)
+        asyncio.create_task(self._handle_claude_thread_reply(channel, thread_ts, merged_text, last_message_ts))
 
     async def _post_error(self, channel: str, thread_ts: str, exc: Exception) -> None:
         """Post an error summary to the Slack thread so the user knows what went wrong."""
@@ -456,14 +494,43 @@ class SlackDaemon:
 
         return chunks
 
-    async def _post_response(self, channel: str, thread_ts: str, text: str) -> None:
+    async def _delete_progress(self, channel: str, progress_ts: str | None) -> None:
+        """Delete a progress message if it exists."""
+        if not progress_ts:
+            return
+        try:
+            await self._app.client.chat_delete(channel=channel, ts=progress_ts)
+        except Exception:
+            pass
+
+    async def _post_response(
+        self, channel: str, thread_ts: str, text: str, *, progress_ts: str | None = None,
+    ) -> None:
         """Post a response to Slack, splitting if it exceeds the message length limit.
 
-        For very long responses (>3 chunks), uploads as a text file instead.
+        If *progress_ts* is provided and the response fits in a single message,
+        the progress message is updated in-place for a seamless transition.
+        For multi-chunk or file responses, the progress message is deleted first.
         """
         text = self._markdown_to_slack(text)
 
+        if not text or not text.strip():
+            await self._delete_progress(channel, progress_ts)
+            return
+
         chunks = self._split_message(text, SLACK_MAX_MESSAGE_LENGTH)
+
+        # Single chunk — update progress message in-place if available
+        if len(chunks) == 1 and progress_ts:
+            try:
+                await self._app.client.chat_update(
+                    channel=channel, ts=progress_ts, text=chunks[0], mrkdwn=True,
+                )
+                return
+            except Exception:
+                pass  # Fall through to normal post
+
+        await self._delete_progress(channel, progress_ts)
 
         # If it's too many chunks, upload as a file instead
         if len(chunks) > 3:
@@ -576,18 +643,15 @@ class EventPoster:
         if now - self._last_post >= _POST_INTERVAL:
             await self._post_or_update()
 
-    async def flush(self) -> None:
-        """Post any remaining buffered progress and finalize the message."""
+    async def flush(self) -> str | None:
+        """Post any remaining buffered progress and return the progress message ts.
+
+        The caller can reuse the progress message to update it with the final
+        response, avoiding an extra post+delete cycle.
+        """
         if self._dirty:
             await self._post_or_update()
-        # Delete the progress message — the final result will be posted separately.
-        if self._progress_ts:
-            try:
-                await self._client.chat_delete(
-                    channel=self._channel, ts=self._progress_ts,
-                )
-            except Exception:
-                pass  # Best effort — might lack permission.
+        return self._progress_ts
 
     # ------------------------------------------------------------------
 
