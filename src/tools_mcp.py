@@ -20,11 +20,9 @@ from fastmcp import FastMCP
 from slack_sdk.web.async_client import AsyncWebClient
 
 from file_downloader import download_file_by_id
+from log_setup import setup_logging
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
+setup_logging()
 logger = logging.getLogger(__name__)
 
 PROJECTS_ROOT = Path(os.environ.get("PROJECTS_DIR", "/home/lemon/claude-projects"))

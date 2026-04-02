@@ -14,13 +14,11 @@ from fastmcp import FastMCP
 from slack_bolt.async_app import AsyncApp
 
 from config import Config
+from log_setup import setup_logging
 from mcp_server import MCPServer
 from session_broker import SessionBroker
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
+setup_logging()
 logger = logging.getLogger(__name__)
 
 

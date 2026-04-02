@@ -17,15 +17,13 @@ import time
 from pathlib import Path
 
 from config import Config
+from log_setup import setup_logging
 from slack_daemon import SlackDaemon
 
 SESSION_MAX_AGE_DAYS = 7
 CLAUDE_SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
+setup_logging()
 logger = logging.getLogger(__name__)
 
 

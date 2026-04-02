@@ -272,6 +272,7 @@ claude-slack-bridge/
 │   ├── mcp_server.py      # ask_on_slack MCP 도구 등록
 │   ├── tools_mcp.py       # notify/upload/download MCP 도구 (Slack→Claude 방향)
 │   ├── file_downloader.py # Slack 파일 다운로드 유틸리티
+│   ├── log_setup.py       # 공통 로깅 설정 (stdout INFO + error.log ERROR)
 │   └── config.py          # 환경 변수 유효성 검사 (pydantic-settings)
 ├── docs/
 │   ├── slack-setup.md     # Slack 앱 생성 가이드
