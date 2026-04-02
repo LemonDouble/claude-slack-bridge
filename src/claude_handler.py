@@ -173,11 +173,13 @@ class ClaudeHandler:
         session_id: str | None = None,
         resume: str | None = None,
     ) -> list[str]:
+        project_root = str(Path(__file__).resolve().parent.parent)
+        tools_mcp_path = str(Path(__file__).resolve().parent / "tools_mcp.py")
         mcp_config = json.dumps({
             "mcpServers": {
                 "slack-tools": {
-                    "command": "python",
-                    "args": [str(Path(__file__).resolve().parent / "tools_mcp.py")],
+                    "command": "uv",
+                    "args": ["run", "--project", project_root, "python", tools_mcp_path],
                 }
             }
         })
@@ -328,6 +330,8 @@ class ClaudeHandler:
 
     async def _build_thread_prompt(self, channel: str, thread_ts: str) -> str:
         """Fetch Slack thread history and format as a conversation prompt."""
+        from file_downloader import format_file_metadata
+
         resp = await self._slack_client.conversations_replies(
             channel=channel, ts=thread_ts
         )
@@ -341,6 +345,9 @@ class ClaudeHandler:
             )
             label = "[Assistant]" if is_bot else "[Human]"
             text = msg.get("text", "")
+            files = msg.get("files", [])
+            if files:
+                text += format_file_metadata(files)
             lines.append(f"{label}: {text}")
 
         return "\n".join(lines)

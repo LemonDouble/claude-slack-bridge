@@ -4,3 +4,4 @@
 projects.json
 .venv
 __pycache__/
+.slack-downloads/

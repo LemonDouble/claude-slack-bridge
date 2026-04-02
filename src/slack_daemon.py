@@ -28,6 +28,7 @@ from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 from slack_bolt.async_app import AsyncApp
 
 from claude_handler import ClaudeHandler
+from file_downloader import format_file_metadata
 
 logger = logging.getLogger(__name__)
 
@@ -134,6 +135,10 @@ class SlackDaemon:
         thread_ts: str | None = event.get("thread_ts")
         text: str = event.get("text", "")
         channel: str = event.get("channel", "")
+        files: list[dict] = event.get("files", [])
+        logger.info("Message event keys: %s, has files: %d, subtype: %s, text: %r, bot_id: %s, display_as_bot: %s, thread_ts: %s",
+                     list(event.keys()), len(files), event.get("subtype"), text[:100],
+                     event.get("bot_id"), event.get("display_as_bot"), thread_ts)
 
         # Case 1: Threaded reply WITH a pending MCP session — forward to session.
         if thread_ts:
@@ -142,6 +147,8 @@ class SlackDaemon:
 
             if writer is not None:
                 logger.info("Slack reply in thread %s: %r", thread_ts, text)
+                if files:
+                    text += format_file_metadata(files)
                 try:
                     writer.write(text.encode() + b"\n")
                     await writer.drain()
@@ -155,10 +162,15 @@ class SlackDaemon:
         # Case 2: Threaded reply with NO pending session — continue Claude conversation.
         if thread_ts:
             if thread_ts in self._active_threads:
+                logger.info("Thread %s is active, skipping.", thread_ts)
                 return
-            # Only continue if this thread has a project assigned
-            if self._claude.get_thread_project(thread_ts):
+            project = self._claude.get_thread_project(thread_ts)
+            logger.info("Thread %s project lookup: %s (known projects: %s)",
+                        thread_ts, project, list(self._claude._thread_projects.keys()))
+            if project:
                 message_ts = event.get("ts", thread_ts)
+                if files:
+                    text += format_file_metadata(files)
                 asyncio.create_task(self._handle_claude_thread_reply(channel, thread_ts, text, message_ts))
             return
 

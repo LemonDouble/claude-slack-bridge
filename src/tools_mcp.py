@@ -19,6 +19,8 @@ load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 from fastmcp import FastMCP
 from slack_sdk.web.async_client import AsyncWebClient
 
+from file_downloader import download_file_by_id
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -121,6 +123,37 @@ async def upload_to_slack(file_path: str, message: str = "") -> str:
     await client.files_upload_v2(**kwargs)
     logger.info("File uploaded: %s", file_path)
     return f"파일이 업로드되었습니다: {path.name}"
+
+
+@mcp.tool()
+async def download_slack_file(file_id: str) -> str:
+    """
+    Download a file from Slack by its file ID.
+
+    Use this when a Slack message includes attached files. The message text
+    will list file metadata with IDs — call this tool with the file_id
+    to download it to the local project directory.
+
+    The downloaded file can then be read with the Read tool (images
+    are viewable directly) or processed with other tools.
+
+    Args:
+        file_id: Slack 파일 ID (F로 시작, 예: F08U1ABCDEF).
+
+    Returns:
+        다운로드된 파일의 절대 경로, 또는 에러 메시지.
+    """
+    logger.info("download_slack_file called: file_id=%s", file_id)
+    client = _get_client()
+    try:
+        path = await download_file_by_id(
+            file_id=file_id,
+            bot_token=client.token,
+            dest_dir=PROJECTS_ROOT,
+        )
+        return str(path)
+    except Exception as exc:
+        return f"오류: 파일 다운로드 실패 — {exc}"
 
 
 if __name__ == "__main__":

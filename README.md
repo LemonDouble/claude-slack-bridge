@@ -184,6 +184,19 @@ Claude가 컨텍스트만으로는 해결할 수 없는 결정이 필요할 때 
 > *"학습 결과 그래프를 Slack에 올려줘."*
 > *"로그 파일을 Slack으로 보내줘."*
 
+### `download_slack_file` — Slack 첨부파일 다운로드
+
+Slack 메시지에 첨부된 파일(이미지, 문서 등)을 로컬로 다운로드합니다. 사용자가 Slack에서 파일을 보내면 메시지에 파일 ID와 메타데이터가 자동으로 포함되며, Claude가 이 도구를 호출하여 파일을 다운로드하고 내용을 확인할 수 있습니다.
+
+**입력:** `file_id` — Slack 파일 ID (`F`로 시작, 예: `F08U1ABCDEF`)
+**출력:** 다운로드된 파일의 절대 경로
+**저장 위치:** `PROJECTS_DIR/.slack-downloads/`
+
+사용 예시:
+
+> *Slack에서 스크린샷을 첨부하며 "이 에러 고쳐줘"*
+> *Slack에서 CSV 파일을 보내며 "이 데이터 분석해줘"*
+
 ---
 
 ## 실시간 진행 상황 표시
@@ -257,7 +270,8 @@ claude-slack-bridge/
 │   ├── slack_daemon.py    # Slack Socket Mode + Unix 소켓 서버
 │   ├── session_broker.py  # Unix 소켓 클라이언트 — 메시지 게시, 답변 대기
 │   ├── mcp_server.py      # ask_on_slack MCP 도구 등록
-│   ├── tools_mcp.py       # notify/upload MCP 도구 (Slack→Claude 방향)
+│   ├── tools_mcp.py       # notify/upload/download MCP 도구 (Slack→Claude 방향)
+│   ├── file_downloader.py # Slack 파일 다운로드 유틸리티
 │   └── config.py          # 환경 변수 유효성 검사 (pydantic-settings)
 ├── docs/
 │   ├── slack-setup.md     # Slack 앱 생성 가이드
