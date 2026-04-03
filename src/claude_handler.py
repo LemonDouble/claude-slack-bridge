@@ -17,7 +17,7 @@ import asyncio
 import json
 import logging
 import os
-import uuid
+import signal
 from collections.abc import Callable, Coroutine
 from pathlib import Path
 from typing import Any
@@ -46,6 +46,7 @@ class ClaudeHandler:
         self._idle_timeout = idle_timeout_minutes * 60
         self._sessions: dict[str, str] = {}  # thread_ts → session UUID
         self._thread_projects: dict[str, str] = {}  # thread_ts → project dir
+        self._active_processes: dict[str, asyncio.subprocess.Process] = {}
         self._load_state()
 
     async def initialize(self) -> None:
@@ -127,16 +128,13 @@ class ClaudeHandler:
         on_event: OnEventFn | None = None,
     ) -> str:
         """Handle a new top-level Slack message (start a new Claude session)."""
-        session_id = str(uuid.uuid4())
-        self._sessions[message_ts] = session_id
-        self._save_state()
-        logger.info("New Claude session %s for thread %s", session_id, message_ts)
-
+        logger.info("New Claude message for thread %s", message_ts)
         project_dir = self._thread_projects.get(message_ts)
-        cmd = self._build_cmd(session_id=session_id)
+        cmd = self._build_cmd()
         return await self._run_claude(
             cmd, text, cwd=project_dir, on_event=on_event,
             slack_channel=channel, slack_thread_ts=message_ts,
+            thread_ts=message_ts,
         )
 
     async def handle_thread_reply(
@@ -153,6 +151,7 @@ class ClaudeHandler:
             return await self._run_claude(
                 cmd, text, cwd=project_dir, on_event=on_event,
                 slack_channel=channel, slack_thread_ts=thread_ts,
+                thread_ts=thread_ts,
             )
 
         # Fallback: session lost (process restart) — use thread history as context.
@@ -162,6 +161,7 @@ class ClaudeHandler:
         return await self._run_claude(
             cmd, prompt, cwd=project_dir, on_event=on_event,
             slack_channel=channel, slack_thread_ts=thread_ts,
+            thread_ts=thread_ts,
         )
 
     # ------------------------------------------------------------------
@@ -196,10 +196,33 @@ class ClaudeHandler:
             cmd.extend(["--resume", resume])
         return cmd
 
+    async def cancel_thread(self, thread_ts: str) -> bool:
+        """Cancel the active Claude process for a thread (SIGINT + fallback SIGKILL).
+
+        Sends SIGINT and returns immediately. The running _run_claude will
+        detect EOF and clean up. A background task sends SIGKILL after 10s
+        if the process hasn't exited yet.
+        """
+        process = self._active_processes.get(thread_ts)
+        if not process or process.returncode is not None:
+            return False
+        logger.info("Cancelling Claude process for thread %s (pid=%d)", thread_ts, process.pid)
+        process.send_signal(signal.SIGINT)
+
+        async def _ensure_killed() -> None:
+            await asyncio.sleep(10)
+            if process.returncode is None:
+                logger.warning("Process %d did not exit after SIGINT, sending SIGKILL", process.pid)
+                process.kill()
+
+        asyncio.create_task(_ensure_killed())
+        return True
+
     async def _run_claude(
         self, cmd: list[str], prompt: str, cwd: str | None = None,
         on_event: OnEventFn | None = None,
         slack_channel: str = "", slack_thread_ts: str = "",
+        thread_ts: str = "",
     ) -> str:
         """Spawn a ``claude -p`` subprocess and return the response text.
 
@@ -232,6 +255,10 @@ class ClaudeHandler:
             logger.error("claude CLI not found — is it installed and in PATH?")
             return "죄송합니다. Claude CLI를 사용할 수 없습니다."
 
+        # Track process for cancellation support.
+        if thread_ts:
+            self._active_processes[thread_ts] = process
+
         # Feed prompt and close stdin so Claude starts processing.
         assert process.stdin is not None
         process.stdin.write(prompt.encode("utf-8"))
@@ -261,20 +288,36 @@ class ClaudeHandler:
                 line_str = line_bytes.decode("utf-8", errors="replace")
                 lines.append(line_str)
 
-                # Forward parsed event to callback.
-                if on_event:
-                    stripped = line_str.strip()
-                    if stripped:
+                # Parse event and capture session ID.
+                stripped = line_str.strip()
+                if stripped:
+                    try:
+                        event = json.loads(stripped)
+                    except json.JSONDecodeError:
+                        continue
+                    # Capture session_id from the init event.
+                    if (
+                        thread_ts
+                        and event.get("type") == "system"
+                        and event.get("subtype") == "init"
+                        and event.get("session_id")
+                    ):
+                        self._sessions[thread_ts] = event["session_id"]
+                        self._save_state()
+                        logger.info("Captured session %s for thread %s", event["session_id"], thread_ts)
+                    if on_event:
                         try:
-                            event = json.loads(stripped)
                             await on_event(event)
-                        except (json.JSONDecodeError, Exception) as exc:
+                        except Exception as exc:
                             logger.debug("on_event error: %s", exc)
 
         except Exception:
             process.kill()
             await process.wait()
             raise
+        finally:
+            if thread_ts:
+                self._active_processes.pop(thread_ts, None)
 
         await process.wait()
 

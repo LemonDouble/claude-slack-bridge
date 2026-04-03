@@ -63,6 +63,7 @@ class SlackDaemon:
 
         # Register event/action/view handlers
         self._app.event("message")(self._handle_slack_message)
+        self._app.event("reaction_added")(self._handle_reaction_added)
         self._app.action(re.compile(r"^select_project:.+$"))(self._handle_project_select)
         self._app.action("create_project")(self._handle_create_project)
         self._app.view("create_project_modal")(self._handle_create_project_modal)
@@ -201,6 +202,47 @@ class SlackDaemon:
             text="프로젝트를 선택하세요:",
             blocks=self._build_project_blocks(),
         )
+
+    async def _handle_reaction_added(self, event: dict, say: Any) -> None:  # noqa: ARG002
+        """Handle reaction_added events — :x: cancels an active Claude thread."""
+        if event.get("reaction") != "x":
+            return
+        item = event.get("item", {})
+        if item.get("type") != "message":
+            return
+        channel = item.get("channel", "")
+        message_ts = item.get("ts", "")
+
+        # message_ts could be the thread root or a reply inside the thread.
+        # Check both: direct match, or look up the thread root via Slack API.
+        thread_ts: str | None = None
+        if message_ts in self._active_threads:
+            thread_ts = message_ts
+        else:
+            # Fetch the message to find its thread_ts (root of the thread).
+            try:
+                resp = await self._app.client.conversations_replies(
+                    channel=channel, ts=message_ts, limit=1,
+                )
+                msgs = resp.get("messages", [])
+                if msgs:
+                    root_ts = msgs[0].get("thread_ts", message_ts)
+                    if root_ts in self._active_threads:
+                        thread_ts = root_ts
+            except Exception as exc:
+                logger.debug("Failed to resolve thread for reaction: %s", exc)
+
+        if not thread_ts:
+            return
+
+        logger.info("Cancel requested via :x: reaction for thread %s", thread_ts)
+        cancelled = await self._claude.cancel_thread(thread_ts)
+        if cancelled:
+            await self._app.client.chat_postMessage(
+                channel=channel, thread_ts=thread_ts,
+                text=":no_entry_sign: 작업이 중단되었습니다.",
+                mrkdwn=True,
+            )
 
     # ------------------------------------------------------------------
     # Action handlers (Block Kit interactions)
