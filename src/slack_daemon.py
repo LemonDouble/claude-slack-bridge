@@ -294,7 +294,7 @@ class SlackDaemon:
             text=(
                 f"`{project_name}` 프로젝트가 선택되었습니다. 무엇을 도와드릴까요?\n"
                 f"> :gear: *{model}* · effort *{effort}*"
-                f"  |  `/model`, `/effort`, `/settings` 로 변경 가능"
+                f"  |  `!model`, `!effort`, `!settings` 로 변경 가능"
             ),
             mrkdwn=True,
         )
@@ -398,34 +398,34 @@ class SlackDaemon:
             text=(
                 f"`{project_name}` 프로젝트가 생성되었습니다. 무엇을 도와드릴까요?\n"
                 f"> :gear: *{model}* · effort *{effort}*"
-                f"  |  `/model`, `/effort`, `/settings` 로 변경 가능"
+                f"  |  `!model`, `!effort`, `!settings` 로 변경 가능"
             ),
             mrkdwn=True,
         )
 
     # ------------------------------------------------------------------
-    # Thread slash commands (/model, /effort, /settings, /default)
+    # Thread commands (!model, !effort, !settings, !default)
     # ------------------------------------------------------------------
 
     async def _handle_thread_command(
         self, channel: str, thread_ts: str, message_ts: str, text: str,
     ) -> bool:
-        """Handle slash commands in thread messages. Returns True if handled."""
+        """Handle ! commands in thread messages. Returns True if handled."""
         stripped = text.strip()
-        if not stripped.startswith("/"):
+        if not stripped.startswith("!"):
             return False
 
         parts = stripped.split(None, 1)
         cmd = parts[0].lower()
         arg = parts[1].strip().lower() if len(parts) > 1 else ""
 
-        if cmd == "/model":
+        if cmd == "!model":
             return await self._cmd_model(channel, thread_ts, message_ts, arg)
-        if cmd == "/effort":
+        if cmd == "!effort":
             return await self._cmd_effort(channel, thread_ts, message_ts, arg)
-        if cmd == "/settings":
+        if cmd == "!settings":
             return await self._cmd_settings(channel, thread_ts)
-        if cmd == "/default":
+        if cmd == "!default":
             return await self._cmd_default(channel, thread_ts, message_ts, arg)
 
         return False
@@ -438,7 +438,7 @@ class SlackDaemon:
             options = ", ".join(f"`{m}`" for m in VALID_MODELS)
             await self._app.client.chat_postMessage(
                 channel=channel, thread_ts=thread_ts,
-                text=f":gear: 현재 모델: *{current}*\n사용법: `/model <{options}>`",
+                text=f":gear: 현재 모델: *{current}*\n사용법: `!model <{options}>`",
                 mrkdwn=True,
             )
             return True
@@ -467,7 +467,7 @@ class SlackDaemon:
             options = ", ".join(f"`{e}`" for e in VALID_EFFORTS)
             await self._app.client.chat_postMessage(
                 channel=channel, thread_ts=thread_ts,
-                text=f":gear: 현재 effort: *{current}*\n사용법: `/effort <{options}>`",
+                text=f":gear: 현재 effort: *{current}*\n사용법: `!effort <{options}>`",
                 mrkdwn=True,
             )
             return True
@@ -498,10 +498,10 @@ class SlackDaemon:
             f"> 모델: *{model}*  |  effort: *{effort}*\n"
             f"> 기본값: *{default_model}* / *{default_effort}*\n\n"
             f"*명령어:*\n"
-            f"• `/model sonnet|opus|haiku` — 이 스레드 모델 변경\n"
-            f"• `/effort low|medium|high|max` — 이 스레드 effort 변경\n"
-            f"• `/default model sonnet` — 기본 모델 변경 (전체 적용)\n"
-            f"• `/default effort high` — 기본 effort 변경 (전체 적용)"
+            f"• `!model sonnet|opus|haiku` — 이 스레드 모델 변경\n"
+            f"• `!effort low|medium|high|max` — 이 스레드 effort 변경\n"
+            f"• `!default model sonnet` — 기본 모델 변경 (전체 적용)\n"
+            f"• `!default effort high` — 기본 effort 변경 (전체 적용)"
         )
         await self._app.client.chat_postMessage(
             channel=channel, thread_ts=thread_ts, text=text, mrkdwn=True,
@@ -511,12 +511,12 @@ class SlackDaemon:
     async def _cmd_default(
         self, channel: str, thread_ts: str, message_ts: str, arg: str,
     ) -> bool:
-        """Handle /default model <val> or /default effort <val>."""
+        """Handle !default model <val> or !default effort <val>."""
         parts = arg.split(None, 1)
         if len(parts) != 2 or parts[0] not in ("model", "effort"):
             await self._app.client.chat_postMessage(
                 channel=channel, thread_ts=thread_ts,
-                text=":warning: 사용법: `/default model sonnet` 또는 `/default effort high`",
+                text=":warning: 사용법: `!default model sonnet` 또는 `!default effort high`",
                 mrkdwn=True,
             )
             return True
