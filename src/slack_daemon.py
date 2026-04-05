@@ -435,18 +435,23 @@ class SlackDaemon:
     ) -> bool:
         if not arg:
             current = self._claude.get_model(thread_ts)
-            options = ", ".join(f"`{m}`" for m in VALID_MODELS)
+            default = self._claude.default_model
+            options = " | ".join(VALID_MODELS)
             await self._app.client.chat_postMessage(
                 channel=channel, thread_ts=thread_ts,
-                text=f":gear: 현재 모델: *{current}*\n사용법: `!model <{options}>`",
+                text=(
+                    f":gear: 현재 모델: *{current}* (기본값: *{default}*)\n"
+                    f"사용법: `!model {options}`\n"
+                    f"기본값 변경: `!default model {options}`"
+                ),
                 mrkdwn=True,
             )
             return True
         if arg not in VALID_MODELS:
-            options = ", ".join(f"`{m}`" for m in VALID_MODELS)
+            options = " | ".join(VALID_MODELS)
             await self._app.client.chat_postMessage(
                 channel=channel, thread_ts=thread_ts,
-                text=f":warning: 지원하지 않는 모델입니다. 선택 가능: {options}",
+                text=f":warning: 지원하지 않는 모델입니다. 선택 가능: `{options}`",
                 mrkdwn=True,
             )
             return True
@@ -464,18 +469,23 @@ class SlackDaemon:
     ) -> bool:
         if not arg:
             current = self._claude.get_effort(thread_ts)
-            options = ", ".join(f"`{e}`" for e in VALID_EFFORTS)
+            default = self._claude.default_effort
+            options = " | ".join(VALID_EFFORTS)
             await self._app.client.chat_postMessage(
                 channel=channel, thread_ts=thread_ts,
-                text=f":gear: 현재 effort: *{current}*\n사용법: `!effort <{options}>`",
+                text=(
+                    f":gear: 현재 effort: *{current}* (기본값: *{default}*)\n"
+                    f"사용법: `!effort {options}`\n"
+                    f"기본값 변경: `!default effort {options}`"
+                ),
                 mrkdwn=True,
             )
             return True
         if arg not in VALID_EFFORTS:
-            options = ", ".join(f"`{e}`" for e in VALID_EFFORTS)
+            options = " | ".join(VALID_EFFORTS)
             await self._app.client.chat_postMessage(
                 channel=channel, thread_ts=thread_ts,
-                text=f":warning: 지원하지 않는 effort입니다. 선택 가능: {options}",
+                text=f":warning: 지원하지 않는 effort입니다. 선택 가능: `{options}`",
                 mrkdwn=True,
             )
             return True
