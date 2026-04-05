@@ -19,6 +19,7 @@ import logging
 import os
 import signal
 from collections.abc import Callable, Coroutine
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,19 @@ _STATE_FILE = Path.home() / ".claude" / "slack-bridge-state.json"
 OnEventFn = Callable[[dict[str, Any]], Coroutine[Any, Any, None]]
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ClaudeResult:
+    """Result from a Claude CLI invocation."""
+    text: str
+    total_cost_usd: float = 0.0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_creation_tokens: int = 0
+    duration_ms: int = 0
+    model_usage: dict[str, Any] = field(default_factory=dict)
 
 DEFAULT_IDLE_TIMEOUT = 43200  # 12 hours
 PROJECTS_ROOT = Path(os.environ.get("PROJECTS_DIR", "/home/lemon/claude-projects"))
@@ -126,7 +140,7 @@ class ClaudeHandler:
     async def handle_message(
         self, channel: str, message_ts: str, text: str,
         on_event: OnEventFn | None = None,
-    ) -> str:
+    ) -> ClaudeResult:
         """Handle a new top-level Slack message (start a new Claude session)."""
         logger.info("New Claude message for thread %s", message_ts)
         project_dir = self._thread_projects.get(message_ts)
@@ -140,7 +154,7 @@ class ClaudeHandler:
     async def handle_thread_reply(
         self, channel: str, thread_ts: str, text: str,
         on_event: OnEventFn | None = None,
-    ) -> str:
+    ) -> ClaudeResult:
         """Handle a threaded reply (resume existing session or fallback)."""
         session_id = self._sessions.get(thread_ts)
         project_dir = self._thread_projects.get(thread_ts)
@@ -223,7 +237,7 @@ class ClaudeHandler:
         on_event: OnEventFn | None = None,
         slack_channel: str = "", slack_thread_ts: str = "",
         thread_ts: str = "",
-    ) -> str:
+    ) -> ClaudeResult:
         """Spawn a ``claude -p`` subprocess and return the response text.
 
         Uses ``--output-format stream-json`` and reads stdout line-by-line so
@@ -253,7 +267,7 @@ class ClaudeHandler:
             )
         except FileNotFoundError:
             logger.error("claude CLI not found — is it installed and in PATH?")
-            return "죄송합니다. Claude CLI를 사용할 수 없습니다."
+            return ClaudeResult(text="죄송합니다. Claude CLI를 사용할 수 없습니다.")
 
         # Track process for cancellation support.
         if thread_ts:
@@ -280,7 +294,7 @@ class ClaudeHandler:
                     logger.error(
                         "Claude subprocess idle-timed out after %ds", self._idle_timeout
                     )
-                    return "죄송합니다. 요청 시간이 초과되었습니다. 다시 시도해주세요."
+                    return ClaudeResult(text="죄송합니다. 요청 시간이 초과되었습니다. 다시 시도해주세요.")
 
                 if not line_bytes:  # EOF
                     break
@@ -329,19 +343,20 @@ class ClaudeHandler:
                 "Claude CLI failed (rc=%d) stderr: %s | stdout: %s | cmd: %s | prompt: %r",
                 process.returncode, stderr_text, stdout_text, cmd, prompt[:200],
             )
-            return "죄송합니다. 요청 처리 중 오류가 발생했습니다."
+            return ClaudeResult(text="죄송합니다. 요청 처리 중 오류가 발생했습니다.")
 
         return self._parse_stream_response(lines)
 
     @staticmethod
-    def _parse_stream_response(lines: list[str]) -> str:
-        """Extract the final result text from stream-json output.
+    def _parse_stream_response(lines: list[str]) -> ClaudeResult:
+        """Extract the final result text and usage stats from stream-json output.
 
         ``stream-json`` emits one JSON object per line.  The final message
         with ``"type": "result"`` contains the ``"result"`` field we need.
         Falls back to collecting all ``assistant`` message text blocks.
         """
         result_text: str | None = None
+        result_event: dict[str, Any] | None = None
         text_parts: list[str] = []
 
         for line in lines:
@@ -356,6 +371,7 @@ class ClaudeHandler:
             # The final "result" event carries the complete answer.
             if event.get("type") == "result":
                 result_text = event.get("result", "")
+                result_event = event
                 break
 
             # Accumulate assistant text blocks as fallback.
@@ -365,11 +381,24 @@ class ClaudeHandler:
                         text_parts.append(block["text"])
 
         if result_text is not None:
-            return result_text
-        if text_parts:
-            return "\n\n".join(text_parts)
-        # Last resort: return raw concatenation.
-        return "".join(lines).strip()
+            text = result_text
+        elif text_parts:
+            text = "\n\n".join(text_parts)
+        else:
+            text = "".join(lines).strip()
+
+        # Extract usage stats from the result event.
+        cr = ClaudeResult(text=text)
+        if result_event:
+            cr.total_cost_usd = result_event.get("total_cost_usd", 0.0)
+            cr.duration_ms = result_event.get("duration_ms", 0)
+            cr.model_usage = result_event.get("modelUsage", {})
+            usage = result_event.get("usage", {})
+            cr.input_tokens = usage.get("input_tokens", 0)
+            cr.output_tokens = usage.get("output_tokens", 0)
+            cr.cache_read_tokens = usage.get("cache_read_input_tokens", 0)
+            cr.cache_creation_tokens = usage.get("cache_creation_input_tokens", 0)
+        return cr
 
     async def _build_thread_prompt(self, channel: str, thread_ts: str) -> str:
         """Fetch Slack thread history and format as a conversation prompt."""

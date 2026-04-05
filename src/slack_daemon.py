@@ -28,7 +28,7 @@ from typing import Any
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 from slack_bolt.async_app import AsyncApp
 
-from claude_handler import ClaudeHandler
+from claude_handler import ClaudeHandler, ClaudeResult
 from file_downloader import format_file_metadata
 
 logger = logging.getLogger(__name__)
@@ -413,11 +413,12 @@ class SlackDaemon:
         await self._add_reaction(channel, message_ts, "hourglass_flowing_sand")
         poster = self._make_event_poster(channel, message_ts)
         try:
-            response = await self._claude.handle_message(
+            result = await self._claude.handle_message(
                 channel, message_ts, text, on_event=poster.handle_event,
             )
             progress_ts = await poster.flush()
-            await self._post_response(channel, message_ts, response, progress_ts=progress_ts)
+            await self._post_response(channel, message_ts, result.text, progress_ts=progress_ts)
+            await self._post_usage_footer(channel, message_ts, result)
             await self._remove_reaction(channel, message_ts, "hourglass_flowing_sand")
             await self._add_reaction(channel, message_ts, "white_check_mark")
         except Exception as exc:
@@ -436,11 +437,12 @@ class SlackDaemon:
         await self._add_reaction(channel, react_ts, "hourglass_flowing_sand")
         poster = self._make_event_poster(channel, thread_ts)
         try:
-            response = await self._claude.handle_thread_reply(
+            result = await self._claude.handle_thread_reply(
                 channel, thread_ts, text, on_event=poster.handle_event,
             )
             progress_ts = await poster.flush()
-            await self._post_response(channel, thread_ts, response, progress_ts=progress_ts)
+            await self._post_response(channel, thread_ts, result.text, progress_ts=progress_ts)
+            await self._post_usage_footer(channel, thread_ts, result)
             await self._remove_reaction(channel, react_ts, "hourglass_flowing_sand")
             await self._add_reaction(channel, react_ts, "white_check_mark")
         except Exception as exc:
@@ -486,6 +488,34 @@ class SlackDaemon:
             )
         except Exception as post_exc:
             logger.warning("Failed to post error message: %s", post_exc)
+
+    async def _post_usage_footer(self, channel: str, thread_ts: str, result: ClaudeResult) -> None:
+        """Post a small usage/cost summary as a thread reply."""
+        if result.total_cost_usd == 0 and result.input_tokens == 0:
+            return
+
+        duration_s = result.duration_ms / 1000
+        total_input = result.input_tokens + result.cache_read_tokens + result.cache_creation_tokens
+
+        # Extract model name (e.g. "claude-opus-4-6" → "Opus 4.6")
+        model_names = list(result.model_usage.keys())
+        model_label = _format_model_name(model_names[0]) if model_names else "Unknown"
+
+        parts = [f":bar_chart: *{model_label}* | "]
+        parts.append(f"Tokens In: `{total_input:,}` Out: `{result.output_tokens:,}`")
+        if result.cache_read_tokens:
+            cache_pct = result.cache_read_tokens / total_input * 100 if total_input else 0
+            parts.append(f" (cache hit `{cache_pct:.0f}%`)")
+        parts.append(f" | Cost: `${result.total_cost_usd:.4f}`")
+        parts.append(f" | Time: `{duration_s:.1f}s`")
+
+        text = "".join(parts)
+        try:
+            await self._app.client.chat_postMessage(
+                channel=channel, thread_ts=thread_ts, text=text, mrkdwn=True,
+            )
+        except Exception as exc:
+            logger.warning("Failed to post usage footer: %s", exc)
 
     @staticmethod
     def _markdown_to_slack(text: str) -> str:
@@ -744,6 +774,24 @@ class EventPoster:
 
         self._last_post = time.monotonic()
         self._dirty = False
+
+
+def _format_model_name(model_id: str) -> str:
+    """Convert a model ID like 'claude-opus-4-6' to a friendly name like 'Opus 4.6'."""
+    import re as _re
+    # Strip "claude-" prefix and optional date suffix (e.g. "-20251001")
+    name = model_id.removeprefix("claude-")
+    name = _re.sub(r"-\d{8,}$", "", name)
+    # Split into parts: e.g. "opus-4-6" → ["opus", "4", "6"]
+    parts = name.split("-")
+    if len(parts) >= 3 and parts[-2].isdigit() and parts[-1].isdigit():
+        family = " ".join(p.capitalize() for p in parts[:-2])
+        version = f"{parts[-2]}.{parts[-1]}"
+        return f"{family} {version}"
+    if len(parts) >= 2 and parts[-1].isdigit():
+        family = " ".join(p.capitalize() for p in parts[:-1])
+        return f"{family} {parts[-1]}"
+    return name.replace("-", " ").title()
 
 
 def _format_tool_use(block: dict[str, Any]) -> str:
