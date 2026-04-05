@@ -28,7 +28,10 @@ from typing import Any
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 from slack_bolt.async_app import AsyncApp
 
-from claude_handler import ClaudeHandler, ClaudeResult
+from claude_handler import (
+    ClaudeHandler, ClaudeResult,
+    VALID_MODELS, VALID_EFFORTS,
+)
 from file_downloader import format_file_metadata
 
 logger = logging.getLogger(__name__)
@@ -170,6 +173,11 @@ class SlackDaemon:
             if not project:
                 return
             message_ts = event.get("ts", thread_ts)
+
+            # Handle slash commands before forwarding to Claude.
+            if await self._handle_thread_command(channel, thread_ts, message_ts, text):
+                return
+
             if files:
                 text += format_file_metadata(files)
             if thread_ts in self._active_threads:
@@ -273,16 +281,23 @@ class SlackDaemon:
             ],
         )
 
-        # Post initial message in thread and start Claude session
-        thread_msg = await self._app.client.chat_postMessage(
-            channel=channel,
-            thread_ts=original_ts,
-            text=f"`{project_name}` 프로젝트가 선택되었습니다. 무엇을 도와드릴까요?",
-        )
-
         # Associate this thread with the project
         self._claude.set_thread_project(original_ts, project_name)
         logger.info("Project %s selected for thread %s", project_name, original_ts)
+
+        # Post initial message in thread with current settings
+        model = self._claude.get_model(original_ts)
+        effort = self._claude.get_effort(original_ts)
+        await self._app.client.chat_postMessage(
+            channel=channel,
+            thread_ts=original_ts,
+            text=(
+                f"`{project_name}` 프로젝트가 선택되었습니다. 무엇을 도와드릴까요?\n"
+                f"> :gear: *{model}* · effort *{effort}*"
+                f"  |  `/model`, `/effort`, `/settings` 로 변경 가능"
+            ),
+            mrkdwn=True,
+        )
 
     async def _handle_create_project(self, ack: Any, body: dict[str, Any]) -> None:
         """Handle 'New Project' button click — open modal."""
@@ -370,16 +385,172 @@ class SlackDaemon:
             ],
         )
 
-        # Post initial message in thread
-        await self._app.client.chat_postMessage(
-            channel=channel,
-            thread_ts=original_ts,
-            text=f"`{project_name}` 프로젝트가 생성되었습니다. 무엇을 도와드릴까요?",
-        )
-
         # Associate thread with the new project
         self._claude.set_thread_project(original_ts, project_name)
         logger.info("New project %s created for thread %s", project_name, original_ts)
+
+        # Post initial message in thread with current settings
+        model = self._claude.get_model(original_ts)
+        effort = self._claude.get_effort(original_ts)
+        await self._app.client.chat_postMessage(
+            channel=channel,
+            thread_ts=original_ts,
+            text=(
+                f"`{project_name}` 프로젝트가 생성되었습니다. 무엇을 도와드릴까요?\n"
+                f"> :gear: *{model}* · effort *{effort}*"
+                f"  |  `/model`, `/effort`, `/settings` 로 변경 가능"
+            ),
+            mrkdwn=True,
+        )
+
+    # ------------------------------------------------------------------
+    # Thread slash commands (/model, /effort, /settings, /default)
+    # ------------------------------------------------------------------
+
+    async def _handle_thread_command(
+        self, channel: str, thread_ts: str, message_ts: str, text: str,
+    ) -> bool:
+        """Handle slash commands in thread messages. Returns True if handled."""
+        stripped = text.strip()
+        if not stripped.startswith("/"):
+            return False
+
+        parts = stripped.split(None, 1)
+        cmd = parts[0].lower()
+        arg = parts[1].strip().lower() if len(parts) > 1 else ""
+
+        if cmd == "/model":
+            return await self._cmd_model(channel, thread_ts, message_ts, arg)
+        if cmd == "/effort":
+            return await self._cmd_effort(channel, thread_ts, message_ts, arg)
+        if cmd == "/settings":
+            return await self._cmd_settings(channel, thread_ts)
+        if cmd == "/default":
+            return await self._cmd_default(channel, thread_ts, message_ts, arg)
+
+        return False
+
+    async def _cmd_model(
+        self, channel: str, thread_ts: str, message_ts: str, arg: str,
+    ) -> bool:
+        if not arg:
+            current = self._claude.get_model(thread_ts)
+            options = ", ".join(f"`{m}`" for m in VALID_MODELS)
+            await self._app.client.chat_postMessage(
+                channel=channel, thread_ts=thread_ts,
+                text=f":gear: 현재 모델: *{current}*\n사용법: `/model <{options}>`",
+                mrkdwn=True,
+            )
+            return True
+        if arg not in VALID_MODELS:
+            options = ", ".join(f"`{m}`" for m in VALID_MODELS)
+            await self._app.client.chat_postMessage(
+                channel=channel, thread_ts=thread_ts,
+                text=f":warning: 지원하지 않는 모델입니다. 선택 가능: {options}",
+                mrkdwn=True,
+            )
+            return True
+        self._claude.set_thread_model(thread_ts, arg)
+        await self._add_reaction(channel, message_ts, "white_check_mark")
+        await self._app.client.chat_postMessage(
+            channel=channel, thread_ts=thread_ts,
+            text=f":gear: 모델이 *{arg}*로 변경되었습니다.",
+            mrkdwn=True,
+        )
+        return True
+
+    async def _cmd_effort(
+        self, channel: str, thread_ts: str, message_ts: str, arg: str,
+    ) -> bool:
+        if not arg:
+            current = self._claude.get_effort(thread_ts)
+            options = ", ".join(f"`{e}`" for e in VALID_EFFORTS)
+            await self._app.client.chat_postMessage(
+                channel=channel, thread_ts=thread_ts,
+                text=f":gear: 현재 effort: *{current}*\n사용법: `/effort <{options}>`",
+                mrkdwn=True,
+            )
+            return True
+        if arg not in VALID_EFFORTS:
+            options = ", ".join(f"`{e}`" for e in VALID_EFFORTS)
+            await self._app.client.chat_postMessage(
+                channel=channel, thread_ts=thread_ts,
+                text=f":warning: 지원하지 않는 effort입니다. 선택 가능: {options}",
+                mrkdwn=True,
+            )
+            return True
+        self._claude.set_thread_effort(thread_ts, arg)
+        await self._add_reaction(channel, message_ts, "white_check_mark")
+        await self._app.client.chat_postMessage(
+            channel=channel, thread_ts=thread_ts,
+            text=f":gear: effort가 *{arg}*로 변경되었습니다.",
+            mrkdwn=True,
+        )
+        return True
+
+    async def _cmd_settings(self, channel: str, thread_ts: str) -> bool:
+        model = self._claude.get_model(thread_ts)
+        effort = self._claude.get_effort(thread_ts)
+        default_model = self._claude.default_model
+        default_effort = self._claude.default_effort
+        text = (
+            f":gear: *현재 스레드 설정*\n"
+            f"> 모델: *{model}*  |  effort: *{effort}*\n"
+            f"> 기본값: *{default_model}* / *{default_effort}*\n\n"
+            f"*명령어:*\n"
+            f"• `/model sonnet|opus|haiku` — 이 스레드 모델 변경\n"
+            f"• `/effort low|medium|high|max` — 이 스레드 effort 변경\n"
+            f"• `/default model sonnet` — 기본 모델 변경 (전체 적용)\n"
+            f"• `/default effort high` — 기본 effort 변경 (전체 적용)"
+        )
+        await self._app.client.chat_postMessage(
+            channel=channel, thread_ts=thread_ts, text=text, mrkdwn=True,
+        )
+        return True
+
+    async def _cmd_default(
+        self, channel: str, thread_ts: str, message_ts: str, arg: str,
+    ) -> bool:
+        """Handle /default model <val> or /default effort <val>."""
+        parts = arg.split(None, 1)
+        if len(parts) != 2 or parts[0] not in ("model", "effort"):
+            await self._app.client.chat_postMessage(
+                channel=channel, thread_ts=thread_ts,
+                text=":warning: 사용법: `/default model sonnet` 또는 `/default effort high`",
+                mrkdwn=True,
+            )
+            return True
+
+        kind, value = parts[0], parts[1].strip()
+        if kind == "model":
+            if value not in VALID_MODELS:
+                options = ", ".join(f"`{m}`" for m in VALID_MODELS)
+                await self._app.client.chat_postMessage(
+                    channel=channel, thread_ts=thread_ts,
+                    text=f":warning: 선택 가능: {options}", mrkdwn=True,
+                )
+                return True
+            self._claude.set_default_model(value)
+            await self._add_reaction(channel, message_ts, "white_check_mark")
+            await self._app.client.chat_postMessage(
+                channel=channel, thread_ts=thread_ts,
+                text=f":gear: 기본 모델이 *{value}*로 변경되었습니다.", mrkdwn=True,
+            )
+        else:  # effort
+            if value not in VALID_EFFORTS:
+                options = ", ".join(f"`{e}`" for e in VALID_EFFORTS)
+                await self._app.client.chat_postMessage(
+                    channel=channel, thread_ts=thread_ts,
+                    text=f":warning: 선택 가능: {options}", mrkdwn=True,
+                )
+                return True
+            self._claude.set_default_effort(value)
+            await self._add_reaction(channel, message_ts, "white_check_mark")
+            await self._app.client.chat_postMessage(
+                channel=channel, thread_ts=thread_ts,
+                text=f":gear: 기본 effort가 *{value}*로 변경되었습니다.", mrkdwn=True,
+            )
+        return True
 
     # ------------------------------------------------------------------
     # Claude conversation handlers

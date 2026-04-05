@@ -45,6 +45,11 @@ class ClaudeResult:
 DEFAULT_IDLE_TIMEOUT = 43200  # 12 hours
 PROJECTS_ROOT = Path(os.environ.get("PROJECTS_DIR", "/home/lemon/claude-projects"))
 
+VALID_MODELS = ("sonnet", "opus", "haiku")
+VALID_EFFORTS = ("low", "medium", "high", "max")
+DEFAULT_MODEL = "sonnet"
+DEFAULT_EFFORT = "high"
+
 
 class ClaudeHandler:
     """
@@ -61,6 +66,10 @@ class ClaudeHandler:
         self._sessions: dict[str, str] = {}  # thread_ts → session UUID
         self._thread_projects: dict[str, str] = {}  # thread_ts → project dir
         self._active_processes: dict[str, asyncio.subprocess.Process] = {}
+        self._default_model: str = DEFAULT_MODEL
+        self._default_effort: str = DEFAULT_EFFORT
+        self._thread_models: dict[str, str] = {}   # thread_ts → model
+        self._thread_efforts: dict[str, str] = {}  # thread_ts → effort
         self._load_state()
 
     async def initialize(self) -> None:
@@ -81,9 +90,14 @@ class ClaudeHandler:
             data = json.loads(_STATE_FILE.read_text())
             self._thread_projects = data.get("thread_projects", {})
             self._sessions = data.get("sessions", {})
+            self._default_model = data.get("default_model", DEFAULT_MODEL)
+            self._default_effort = data.get("default_effort", DEFAULT_EFFORT)
+            self._thread_models = data.get("thread_models", {})
+            self._thread_efforts = data.get("thread_efforts", {})
             logger.info(
-                "Restored state: %d threads, %d sessions.",
+                "Restored state: %d threads, %d sessions, default=%s/%s.",
                 len(self._thread_projects), len(self._sessions),
+                self._default_model, self._default_effort,
             )
         except Exception as exc:
             logger.warning("Failed to load state: %s", exc)
@@ -95,6 +109,10 @@ class ClaudeHandler:
             _STATE_FILE.write_text(json.dumps({
                 "thread_projects": self._thread_projects,
                 "sessions": self._sessions,
+                "default_model": self._default_model,
+                "default_effort": self._default_effort,
+                "thread_models": self._thread_models,
+                "thread_efforts": self._thread_efforts,
             }))
         except Exception as exc:
             logger.warning("Failed to save state: %s", exc)
@@ -134,6 +152,46 @@ class ClaudeHandler:
         return str(project_dir)
 
     # ------------------------------------------------------------------
+    # Model / effort settings
+    # ------------------------------------------------------------------
+
+    def get_model(self, thread_ts: str) -> str:
+        """Return the model for a thread (falls back to global default)."""
+        return self._thread_models.get(thread_ts, self._default_model)
+
+    def get_effort(self, thread_ts: str) -> str:
+        """Return the effort level for a thread (falls back to global default)."""
+        return self._thread_efforts.get(thread_ts, self._default_effort)
+
+    def set_thread_model(self, thread_ts: str, model: str) -> None:
+        """Set the model for a specific thread."""
+        self._thread_models[thread_ts] = model
+        self._save_state()
+
+    def set_thread_effort(self, thread_ts: str, effort: str) -> None:
+        """Set the effort level for a specific thread."""
+        self._thread_efforts[thread_ts] = effort
+        self._save_state()
+
+    def set_default_model(self, model: str) -> None:
+        """Set the global default model (persisted)."""
+        self._default_model = model
+        self._save_state()
+
+    def set_default_effort(self, effort: str) -> None:
+        """Set the global default effort level (persisted)."""
+        self._default_effort = effort
+        self._save_state()
+
+    @property
+    def default_model(self) -> str:
+        return self._default_model
+
+    @property
+    def default_effort(self) -> str:
+        return self._default_effort
+
+    # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
@@ -144,7 +202,9 @@ class ClaudeHandler:
         """Handle a new top-level Slack message (start a new Claude session)."""
         logger.info("New Claude message for thread %s", message_ts)
         project_dir = self._thread_projects.get(message_ts)
-        cmd = self._build_cmd()
+        model = self.get_model(message_ts)
+        effort = self.get_effort(message_ts)
+        cmd = self._build_cmd(model=model, effort=effort)
         return await self._run_claude(
             cmd, text, cwd=project_dir, on_event=on_event,
             slack_channel=channel, slack_thread_ts=message_ts,
@@ -158,10 +218,12 @@ class ClaudeHandler:
         """Handle a threaded reply (resume existing session or fallback)."""
         session_id = self._sessions.get(thread_ts)
         project_dir = self._thread_projects.get(thread_ts)
+        model = self.get_model(thread_ts)
+        effort = self.get_effort(thread_ts)
 
         if session_id:
             logger.info("Resuming session %s for thread %s", session_id, thread_ts)
-            cmd = self._build_cmd(resume=session_id)
+            cmd = self._build_cmd(resume=session_id, model=model, effort=effort)
             return await self._run_claude(
                 cmd, text, cwd=project_dir, on_event=on_event,
                 slack_channel=channel, slack_thread_ts=thread_ts,
@@ -171,7 +233,7 @@ class ClaudeHandler:
         # Fallback: session lost (process restart) — use thread history as context.
         logger.info("No session for thread %s, falling back to thread history.", thread_ts)
         prompt = await self._build_thread_prompt(channel, thread_ts)
-        cmd = self._build_cmd()
+        cmd = self._build_cmd(model=model, effort=effort)
         return await self._run_claude(
             cmd, prompt, cwd=project_dir, on_event=on_event,
             slack_channel=channel, slack_thread_ts=thread_ts,
@@ -186,6 +248,8 @@ class ClaudeHandler:
     def _build_cmd(
         session_id: str | None = None,
         resume: str | None = None,
+        model: str = DEFAULT_MODEL,
+        effort: str = DEFAULT_EFFORT,
     ) -> list[str]:
         project_root = str(Path(__file__).resolve().parent.parent)
         tools_mcp_path = str(Path(__file__).resolve().parent / "tools_mcp.py")
@@ -202,6 +266,8 @@ class ClaudeHandler:
             "--dangerously-skip-permissions",
             "--verbose",
             "--output-format", "stream-json",
+            "--model", model,
+            "--effort", effort,
             "--mcp-config", mcp_config,
         ]
         if session_id:
