@@ -298,6 +298,11 @@ class ClaudeHandler:
         asyncio.create_task(_ensure_killed())
         return True
 
+    def clear_session(self, thread_ts: str) -> None:
+        """Remove the stored session ID so the next run starts fresh."""
+        if self._sessions.pop(thread_ts, None):
+            self._save_state()
+
     async def _run_claude(
         self, cmd: list[str], prompt: str, cwd: str | None = None,
         on_event: OnEventFn | None = None,

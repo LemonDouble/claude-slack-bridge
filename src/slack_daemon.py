@@ -423,10 +423,12 @@ class SlackDaemon:
             return await self._cmd_model(channel, thread_ts, message_ts, arg)
         if cmd == "!effort":
             return await self._cmd_effort(channel, thread_ts, message_ts, arg)
-        if cmd == "!settings":
+        if cmd in ("!settings", "!help"):
             return await self._cmd_settings(channel, thread_ts)
         if cmd == "!default":
             return await self._cmd_default(channel, thread_ts, message_ts, arg)
+        if cmd == "!restart":
+            return await self._cmd_restart(channel, thread_ts, message_ts, arg)
 
         return False
 
@@ -498,6 +500,33 @@ class SlackDaemon:
         )
         return True
 
+    async def _cmd_restart(
+        self, channel: str, thread_ts: str, message_ts: str, arg: str,
+    ) -> bool:
+        """Kill current Claude process and spawn a fresh session."""
+        self._claude.clear_session(thread_ts)
+
+        if thread_ts in self._active_threads:
+            await self._claude.cancel_thread(thread_ts)
+            self._thread_queues.pop(thread_ts, None)
+            for _ in range(150):
+                if thread_ts not in self._active_threads:
+                    break
+                await asyncio.sleep(0.1)
+
+        await self._add_reaction(channel, message_ts, "arrows_counterclockwise")
+        await self._app.client.chat_postMessage(
+            channel=channel, thread_ts=thread_ts,
+            text=":arrows_counterclockwise: 세션을 재시작합니다...",
+            mrkdwn=True,
+        )
+
+        restart_prompt = arg if arg else "이전 대화 내용을 참고해서, 이어서 작업을 계속 진행해줘."
+        asyncio.create_task(
+            self._handle_claude_thread_reply(channel, thread_ts, restart_prompt, message_ts)
+        )
+        return True
+
     async def _cmd_settings(self, channel: str, thread_ts: str) -> bool:
         model = self._claude.get_model(thread_ts)
         effort = self._claude.get_effort(thread_ts)
@@ -511,7 +540,8 @@ class SlackDaemon:
             f"• `!model sonnet|opus|haiku` — 이 스레드 모델 변경\n"
             f"• `!effort low|medium|high|xhigh|max` — 이 스레드 effort 변경\n"
             f"• `!default model sonnet` — 기본 모델 변경 (전체 적용)\n"
-            f"• `!default effort high` — 기본 effort 변경 (전체 적용)"
+            f"• `!default effort high` — 기본 effort 변경 (전체 적용)\n"
+            f"• `!restart` — 세션 재시작 (현재 작업 중단 후 새 세션으로 이어서 진행)"
         )
         await self._app.client.chat_postMessage(
             channel=channel, thread_ts=thread_ts, text=text, mrkdwn=True,
