@@ -678,9 +678,17 @@ class SlackDaemon:
         duration_s = result.duration_ms / 1000
         total_input = result.input_tokens + result.cache_read_tokens + result.cache_creation_tokens
 
-        # Extract model name (e.g. "claude-opus-4-6" → "Opus 4.6")
-        model_names = list(result.model_usage.keys())
-        model_label = _format_model_name(model_names[0]) if model_names else "Unknown"
+        # Claude Code 4.7+ can aggregate multiple models in modelUsage (e.g. Haiku
+        # for ai-title generation on a new session). Pick the model with the most
+        # output tokens — that's the one that actually produced the answer.
+        if result.model_usage:
+            primary = max(
+                result.model_usage.items(),
+                key=lambda kv: kv[1].get("outputTokens", 0),
+            )[0]
+            model_label = _format_model_name(primary)
+        else:
+            model_label = "Unknown"
 
         parts = [f":bar_chart: *{model_label}* | "]
         parts.append(f"Tokens In: `{total_input:,}` Out: `{result.output_tokens:,}`")
