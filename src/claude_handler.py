@@ -46,7 +46,7 @@ DEFAULT_IDLE_TIMEOUT = 43200  # 12 hours
 PROJECTS_ROOT = Path(os.environ.get("PROJECTS_DIR", "/home/lemon/claude-projects"))
 
 VALID_MODELS = ("sonnet", "opus", "haiku")
-VALID_EFFORTS = ("low", "medium", "high", "max")
+VALID_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 DEFAULT_MODEL = "sonnet"
 DEFAULT_EFFORT = "high"
 
