@@ -509,7 +509,7 @@ class SlackDaemon:
             f"> 기본값: *{default_model}* / *{default_effort}*\n\n"
             f"*명령어:*\n"
             f"• `!model sonnet|opus|haiku` — 이 스레드 모델 변경\n"
-            f"• `!effort low|medium|high|max` — 이 스레드 effort 변경\n"
+            f"• `!effort low|medium|high|xhigh|max` — 이 스레드 effort 변경\n"
             f"• `!default model sonnet` — 기본 모델 변경 (전체 적용)\n"
             f"• `!default effort high` — 기본 effort 변경 (전체 적용)"
         )
