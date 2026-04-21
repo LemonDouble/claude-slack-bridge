@@ -23,7 +23,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-_STATE_FILE = Path.home() / ".claude" / "slack-bridge-state.json"
+from constants import (
+    STATE_FILE, PROJECTS_ROOT,
+    VALID_MODELS, VALID_EFFORTS, DEFAULT_MODEL, DEFAULT_EFFORT,
+)
 
 OnEventFn = Callable[[dict[str, Any]], Coroutine[Any, Any, None]]
 
@@ -42,14 +45,6 @@ class ClaudeResult:
     duration_ms: int = 0
     model_usage: dict[str, Any] = field(default_factory=dict)
     requested_model: str = ""
-
-DEFAULT_IDLE_TIMEOUT = 43200  # 12 hours
-PROJECTS_ROOT = Path(os.environ.get("PROJECTS_DIR", "/home/lemon/claude-projects"))
-
-VALID_MODELS = ("sonnet", "opus", "haiku")
-VALID_EFFORTS = ("low", "medium", "high", "xhigh", "max")
-DEFAULT_MODEL = "sonnet"
-DEFAULT_EFFORT = "high"
 
 
 class ClaudeHandler:
@@ -85,10 +80,10 @@ class ClaudeHandler:
 
     def _load_state(self) -> None:
         """Load persisted thread→project and thread→session mappings."""
-        if not _STATE_FILE.exists():
+        if not STATE_FILE.exists():
             return
         try:
-            data = json.loads(_STATE_FILE.read_text())
+            data = json.loads(STATE_FILE.read_text())
             self._thread_projects = data.get("thread_projects", {})
             self._sessions = data.get("sessions", {})
             self._default_model = data.get("default_model", DEFAULT_MODEL)
@@ -106,8 +101,8 @@ class ClaudeHandler:
     def _save_state(self) -> None:
         """Persist current mappings to disk."""
         try:
-            _STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-            _STATE_FILE.write_text(json.dumps({
+            STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            STATE_FILE.write_text(json.dumps({
                 "thread_projects": self._thread_projects,
                 "sessions": self._sessions,
                 "default_model": self._default_model,
@@ -195,24 +190,6 @@ class ClaudeHandler:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-
-    async def handle_message(
-        self, channel: str, message_ts: str, text: str,
-        on_event: OnEventFn | None = None,
-    ) -> ClaudeResult:
-        """Handle a new top-level Slack message (start a new Claude session)."""
-        logger.info("New Claude message for thread %s", message_ts)
-        project_dir = self._thread_projects.get(message_ts)
-        model = self.get_model(message_ts)
-        effort = self.get_effort(message_ts)
-        cmd = self._build_cmd(model=model, effort=effort)
-        result = await self._run_claude(
-            cmd, text, cwd=project_dir, on_event=on_event,
-            slack_channel=channel, slack_thread_ts=message_ts,
-            thread_ts=message_ts,
-        )
-        result.requested_model = model
-        return result
 
     async def handle_thread_reply(
         self, channel: str, thread_ts: str, text: str,

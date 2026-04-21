@@ -21,23 +21,21 @@ import asyncio
 import logging
 import os
 import re
-import time
 from collections import deque
 from typing import Any
 
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 from slack_bolt.async_app import AsyncApp
 
-from claude_handler import (
-    ClaudeHandler, ClaudeResult,
+from claude_handler import ClaudeHandler, ClaudeResult
+from constants import (
+    SOCKET_PATH, SLACK_MAX_MESSAGE_LENGTH,
     VALID_MODELS, VALID_EFFORTS,
 )
+from event_poster import EventPoster, get_model_label
 from file_downloader import format_file_metadata
 
 logger = logging.getLogger(__name__)
-
-SOCKET_PATH = "/tmp/slack-bridge.sock"
-SLACK_MAX_MESSAGE_LENGTH = 40000
 
 
 class SlackDaemon:
@@ -420,9 +418,19 @@ class SlackDaemon:
         arg = parts[1].strip().lower() if len(parts) > 1 else ""
 
         if cmd == "!model":
-            return await self._cmd_model(channel, thread_ts, message_ts, arg)
+            return await self._cmd_change_setting(
+                channel, thread_ts, message_ts, arg,
+                name="모델", cmd="model", valid=VALID_MODELS,
+                get_current="get_model", set_value="set_thread_model",
+                get_default="default_model",
+            )
         if cmd == "!effort":
-            return await self._cmd_effort(channel, thread_ts, message_ts, arg)
+            return await self._cmd_change_setting(
+                channel, thread_ts, message_ts, arg,
+                name="effort", cmd="effort", valid=VALID_EFFORTS,
+                get_current="get_effort", set_value="set_thread_effort",
+                get_default="default_effort",
+            )
         if cmd in ("!settings", "!help"):
             return await self._cmd_settings(channel, thread_ts)
         if cmd == "!default":
@@ -432,70 +440,40 @@ class SlackDaemon:
 
         return False
 
-    async def _cmd_model(
+    async def _cmd_change_setting(
         self, channel: str, thread_ts: str, message_ts: str, arg: str,
+        *, name: str, cmd: str, valid: tuple[str, ...],
+        get_current: str, set_value: str, get_default: str,
     ) -> bool:
-        if not arg:
-            current = self._claude.get_model(thread_ts)
-            default = self._claude.default_model
-            options = " | ".join(VALID_MODELS)
-            await self._app.client.chat_postMessage(
-                channel=channel, thread_ts=thread_ts,
-                text=(
-                    f":gear: 현재 모델: *{current}* (기본값: *{default}*)\n"
-                    f"사용법: `!model {options}`\n"
-                    f"기본값 변경: `!default model {options}`"
-                ),
-                mrkdwn=True,
-            )
-            return True
-        if arg not in VALID_MODELS:
-            options = " | ".join(VALID_MODELS)
-            await self._app.client.chat_postMessage(
-                channel=channel, thread_ts=thread_ts,
-                text=f":warning: 지원하지 않는 모델입니다. 선택 가능: `{options}`",
-                mrkdwn=True,
-            )
-            return True
-        self._claude.set_thread_model(thread_ts, arg)
-        await self._add_reaction(channel, message_ts, "white_check_mark")
-        await self._app.client.chat_postMessage(
-            channel=channel, thread_ts=thread_ts,
-            text=f":gear: 모델이 *{arg}*로 변경되었습니다.",
-            mrkdwn=True,
-        )
-        return True
+        """!model / !effort 공통 핸들러. get_current/set_value/get_default는 ClaudeHandler 메서드명."""
+        getter = getattr(self._claude, get_current)
+        setter = getattr(self._claude, set_value)
+        default = getattr(self._claude, get_default)
+        options = " | ".join(valid)
 
-    async def _cmd_effort(
-        self, channel: str, thread_ts: str, message_ts: str, arg: str,
-    ) -> bool:
         if not arg:
-            current = self._claude.get_effort(thread_ts)
-            default = self._claude.default_effort
-            options = " | ".join(VALID_EFFORTS)
             await self._app.client.chat_postMessage(
                 channel=channel, thread_ts=thread_ts,
                 text=(
-                    f":gear: 현재 effort: *{current}* (기본값: *{default}*)\n"
-                    f"사용법: `!effort {options}`\n"
-                    f"기본값 변경: `!default effort {options}`"
+                    f":gear: 현재 {name}: *{getter(thread_ts)}* (기본값: *{default}*)\n"
+                    f"사용법: `!{cmd} {options}`\n"
+                    f"기본값 변경: `!default {cmd} {options}`"
                 ),
                 mrkdwn=True,
             )
             return True
-        if arg not in VALID_EFFORTS:
-            options = " | ".join(VALID_EFFORTS)
+        if arg not in valid:
             await self._app.client.chat_postMessage(
                 channel=channel, thread_ts=thread_ts,
-                text=f":warning: 지원하지 않는 effort입니다. 선택 가능: `{options}`",
+                text=f":warning: 지원하지 않는 {name}입니다. 선택 가능: `{options}`",
                 mrkdwn=True,
             )
             return True
-        self._claude.set_thread_effort(thread_ts, arg)
+        setter(thread_ts, arg)
         await self._add_reaction(channel, message_ts, "white_check_mark")
         await self._app.client.chat_postMessage(
             channel=channel, thread_ts=thread_ts,
-            text=f":gear: effort가 *{arg}*로 변경되었습니다.",
+            text=f":gear: {name}이(가) *{arg}*(으)로 변경되었습니다.",
             mrkdwn=True,
         )
         return True
@@ -562,34 +540,25 @@ class SlackDaemon:
             return True
 
         kind, value = parts[0], parts[1].strip()
-        if kind == "model":
-            if value not in VALID_MODELS:
-                options = ", ".join(f"`{m}`" for m in VALID_MODELS)
-                await self._app.client.chat_postMessage(
-                    channel=channel, thread_ts=thread_ts,
-                    text=f":warning: 선택 가능: {options}", mrkdwn=True,
-                )
-                return True
-            self._claude.set_default_model(value)
-            await self._add_reaction(channel, message_ts, "white_check_mark")
+        valid, setter, label = {
+            "model":  (VALID_MODELS,  self._claude.set_default_model,  "모델"),
+            "effort": (VALID_EFFORTS, self._claude.set_default_effort, "effort"),
+        }[kind]
+
+        if value not in valid:
+            options = ", ".join(f"`{v}`" for v in valid)
             await self._app.client.chat_postMessage(
                 channel=channel, thread_ts=thread_ts,
-                text=f":gear: 기본 모델이 *{value}*로 변경되었습니다.", mrkdwn=True,
+                text=f":warning: 선택 가능: {options}", mrkdwn=True,
             )
-        else:  # effort
-            if value not in VALID_EFFORTS:
-                options = ", ".join(f"`{e}`" for e in VALID_EFFORTS)
-                await self._app.client.chat_postMessage(
-                    channel=channel, thread_ts=thread_ts,
-                    text=f":warning: 선택 가능: {options}", mrkdwn=True,
-                )
-                return True
-            self._claude.set_default_effort(value)
-            await self._add_reaction(channel, message_ts, "white_check_mark")
-            await self._app.client.chat_postMessage(
-                channel=channel, thread_ts=thread_ts,
-                text=f":gear: 기본 effort가 *{value}*로 변경되었습니다.", mrkdwn=True,
-            )
+            return True
+
+        setter(value)
+        await self._add_reaction(channel, message_ts, "white_check_mark")
+        await self._app.client.chat_postMessage(
+            channel=channel, thread_ts=thread_ts,
+            text=f":gear: 기본 {label}이(가) *{value}*(으)로 변경되었습니다.", mrkdwn=True,
+        )
         return True
 
     # ------------------------------------------------------------------
@@ -617,28 +586,6 @@ class SlackDaemon:
     def _make_event_poster(self, channel: str, thread_ts: str) -> "EventPoster":
         """Create an EventPoster that formats and posts Claude stream events."""
         return EventPoster(self._app.client, channel, thread_ts)
-
-    async def _handle_claude_new_message(self, channel: str, message_ts: str, text: str) -> None:
-        """Spawn Claude for a new top-level message and post the response as a thread reply."""
-        self._active_threads.add(message_ts)
-        await self._add_reaction(channel, message_ts, "hourglass_flowing_sand")
-        poster = self._make_event_poster(channel, message_ts)
-        try:
-            result = await self._claude.handle_message(
-                channel, message_ts, text, on_event=poster.handle_event,
-            )
-            progress_ts = await poster.flush()
-            await self._post_response(channel, message_ts, result.text, progress_ts=progress_ts)
-            await self._post_usage_footer(channel, message_ts, result)
-            await self._remove_reaction(channel, message_ts, "hourglass_flowing_sand")
-            await self._add_reaction(channel, message_ts, "white_check_mark")
-        except Exception as exc:
-            logger.error("Error handling top-level message %s: %s", message_ts, exc)
-            await self._remove_reaction(channel, message_ts, "hourglass_flowing_sand")
-            await self._add_reaction(channel, message_ts, "x")
-            await self._post_error(channel, message_ts, exc)
-        finally:
-            self._active_threads.discard(message_ts)
 
     async def _handle_claude_thread_reply(self, channel: str, thread_ts: str, text: str, message_ts: str | None = None) -> None:
         """Spawn Claude for a thread reply and post the response."""
@@ -708,7 +655,7 @@ class SlackDaemon:
         duration_s = result.duration_ms / 1000
         total_input = result.input_tokens + result.cache_read_tokens + result.cache_creation_tokens
 
-        model_label = _get_model_label(result.requested_model, result.model_usage)
+        model_label = get_model_label(result.requested_model, result.model_usage)
 
         parts = [f":bar_chart: *{model_label}* | "]
         parts.append(f"Tokens In: `{total_input:,}` Out: `{result.output_tokens:,}`")
@@ -884,163 +831,3 @@ class SlackDaemon:
                 server.serve_forever(),
                 self._handler.start_async(),
             )
-
-
-# ======================================================================
-# EventPoster — formats stream-json events and posts progress to Slack
-# ======================================================================
-
-# Minimum interval between Slack progress posts (seconds).
-_POST_INTERVAL = 3.0
-
-
-class EventPoster:
-    """Accumulates Claude stream-json events and posts formatted progress to a Slack thread.
-
-    Batches events to stay within Slack rate limits (~1 msg/sec) and updates
-    a single "progress" message instead of spamming many messages.
-    """
-
-    def __init__(self, slack_client: Any, channel: str, thread_ts: str) -> None:
-        self._client = slack_client
-        self._channel = channel
-        self._thread_ts = thread_ts
-        self._progress_ts: str | None = None  # ts of the live progress message
-        self._lines: list[str] = []           # accumulated progress lines
-        self._last_post: float = 0.0
-        self._dirty = False
-
-    async def handle_event(self, event: dict[str, Any]) -> None:
-        """Process a single stream-json event."""
-        line = self._format_event(event)
-        if line is None:
-            return
-
-        self._lines.append(line)
-        self._dirty = True
-
-        # Throttle: only post/update every _POST_INTERVAL seconds.
-        now = time.monotonic()
-        if now - self._last_post >= _POST_INTERVAL:
-            await self._post_or_update()
-
-    async def flush(self) -> str | None:
-        """Post any remaining buffered progress and return the progress message ts.
-
-        The caller can reuse the progress message to update it with the final
-        response, avoiding an extra post+delete cycle.
-        """
-        if self._dirty:
-            await self._post_or_update()
-        return self._progress_ts
-
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _format_event(event: dict[str, Any]) -> str | None:
-        """Return a single formatted line for an event, or None to skip."""
-        etype = event.get("type")
-
-        # --- assistant message: extract tool_use blocks ---
-        if etype == "assistant":
-            content = event.get("message", {}).get("content", [])
-            parts: list[str] = []
-            for block in content:
-                if not isinstance(block, dict):
-                    continue
-                if block.get("type") == "tool_use":
-                    parts.append(_format_tool_use(block))
-            return "\n".join(parts) if parts else None
-
-        # --- system init ---
-        if etype == "system" and event.get("subtype") == "init":
-            session_id = event.get("session_id", "")[:8]
-            return f":rocket:  세션 시작 (`{session_id}…`)"
-
-        # Skip result (handled separately) and other noise.
-        return None
-
-    async def _post_or_update(self) -> None:
-        """Post a new progress message or update the existing one."""
-        # Keep the last 30 lines to stay within Slack message limits.
-        visible = self._lines[-30:]
-        text = "\n".join(visible)
-        if not text:
-            return
-
-        try:
-            if self._progress_ts:
-                await self._client.chat_update(
-                    channel=self._channel, ts=self._progress_ts, text=text, mrkdwn=True,
-                )
-            else:
-                resp = await self._client.chat_postMessage(
-                    channel=self._channel, thread_ts=self._thread_ts, text=text, mrkdwn=True,
-                )
-                self._progress_ts = resp["ts"]
-        except Exception as exc:
-            logger.warning("EventPoster post/update failed: %s", exc)
-
-        self._last_post = time.monotonic()
-        self._dirty = False
-
-
-def _get_model_label(requested: str, model_usage: dict[str, Any]) -> str:
-    """Return a display label using the requested model name.
-
-    Looks up the exact version from modelUsage keys (e.g. "opus" → "claude-opus-4-7" → "Opus 4.7").
-    Falls back to capitalizing the short name if modelUsage has no match.
-    """
-    for model_id in model_usage:
-        if requested and requested in model_id:
-            return _format_model_name(model_id)
-    return requested.capitalize() if requested else "Unknown"
-
-
-def _format_model_name(model_id: str) -> str:
-    """Convert a model ID like 'claude-opus-4-6' to a friendly name like 'Opus 4.6'."""
-    import re as _re
-    # Strip "claude-" prefix and optional date suffix (e.g. "-20251001")
-    name = model_id.removeprefix("claude-")
-    name = _re.sub(r"-\d{8,}$", "", name)
-    # Split into parts: e.g. "opus-4-6" → ["opus", "4", "6"]
-    parts = name.split("-")
-    if len(parts) >= 3 and parts[-2].isdigit() and parts[-1].isdigit():
-        family = " ".join(p.capitalize() for p in parts[:-2])
-        version = f"{parts[-2]}.{parts[-1]}"
-        return f"{family} {version}"
-    if len(parts) >= 2 and parts[-1].isdigit():
-        family = " ".join(p.capitalize() for p in parts[:-1])
-        return f"{family} {parts[-1]}"
-    return name.replace("-", " ").title()
-
-
-def _format_tool_use(block: dict[str, Any]) -> str:
-    """Format a tool_use content block into a readable Slack line."""
-    name = block.get("name", "unknown")
-    inp = block.get("input", {})
-
-    if name == "Bash":
-        cmd = inp.get("command", "")
-        display = cmd if len(cmd) <= 120 else cmd[:117] + "…"
-        return f":terminal:  `$ {display}`"
-
-    if name in ("Read", "Glob"):
-        path = inp.get("file_path") or inp.get("pattern", "")
-        return f":page_facing_up:  *{name}* `{path}`"
-
-    if name in ("Edit", "Write"):
-        path = inp.get("file_path", "")
-        return f":pencil2:  *{name}* `{path}`"
-
-    if name == "Grep":
-        pattern = inp.get("pattern", "")
-        return f":mag:  *Grep* `{pattern}`"
-
-    if name in ("Agent", "agent"):
-        desc = inp.get("description") or inp.get("prompt", "")[:60]
-        return f":robot_face:  *Agent* {desc}"
-
-    # Generic fallback
-    summary = str(inp)[:80]
-    return f":hammer_and_wrench:  *{name}* {summary}"

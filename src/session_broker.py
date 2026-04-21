@@ -11,9 +11,9 @@ import logging
 from collections.abc import Callable, Coroutine
 from typing import Any
 
-logger = logging.getLogger(__name__)
+from constants import SOCKET_PATH
 
-SOCKET_PATH = "/tmp/slack-bridge.sock"
+logger = logging.getLogger(__name__)
 
 PostMessageFn = Callable[[str, str | None], Coroutine[Any, Any, str]]
 

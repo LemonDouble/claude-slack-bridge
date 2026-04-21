@@ -9,9 +9,25 @@ from pathlib import Path
 
 import aiohttp
 
+from constants import PROJECTS_ROOT
+
 logger = logging.getLogger(__name__)
 
 DOWNLOADS_DIR_NAME = ".slack-downloads"
+
+
+def validate_upload_path(file_path: str) -> Path | str:
+    """PROJECTS_ROOT 내 파일인지 검증. 성공 시 Path, 실패 시 에러 문자열 반환."""
+    path = Path(file_path)
+    try:
+        path.resolve().relative_to(PROJECTS_ROOT.resolve())
+    except ValueError:
+        return f"오류: PROJECTS_DIR 디렉토리 밖의 파일은 업로드할 수 없습니다. (요청: {file_path})"
+    if not path.exists():
+        return f"오류: 파일을 찾을 수 없습니다. ({file_path})"
+    if not path.is_file():
+        return f"오류: 디렉토리는 업로드할 수 없습니다. ({file_path})"
+    return path
 
 
 def format_file_metadata(files: list[dict]) -> str:

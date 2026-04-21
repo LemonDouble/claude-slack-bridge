@@ -8,17 +8,14 @@ Registers MCP tools on a FastMCP instance:
 """
 
 import logging
-import os
 from pathlib import Path
 from typing import Any
 
 from fastmcp import FastMCP
 
-from file_downloader import download_file_by_id
+from file_downloader import download_file_by_id, validate_upload_path
 
 logger = logging.getLogger(__name__)
-
-PROJECTS_ROOT = Path(os.environ.get("PROJECTS_DIR", "/home/lemon/claude-projects"))
 
 
 class MCPServer:
@@ -112,19 +109,10 @@ class MCPServer:
         """
         logger.info("upload_to_slack called: file=%s, message=%r", file_path, message)
 
-        path = Path(file_path)
-
-        # Security: only allow files under PROJECTS_DIR
-        try:
-            path.resolve().relative_to(PROJECTS_ROOT.resolve())
-        except ValueError:
-            return f"오류: PROJECTS_DIR 디렉토리 밖의 파일은 업로드할 수 없습니다. (요청: {file_path})"
-
-        if not path.exists():
-            return f"오류: 파일을 찾을 수 없습니다. ({file_path})"
-
-        if not path.is_file():
-            return f"오류: 디렉토리는 업로드할 수 없습니다. ({file_path})"
+        result = validate_upload_path(file_path)
+        if isinstance(result, str):
+            return result
+        path = result
 
         # Ensure we have a thread to upload into.
         if not self._thread_ts:

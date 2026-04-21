@@ -19,13 +19,11 @@ load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 from fastmcp import FastMCP
 from slack_sdk.web.async_client import AsyncWebClient
 
-from file_downloader import download_file_by_id
+from file_downloader import download_file_by_id, validate_upload_path
 from log_setup import setup_logging
 
 setup_logging()
 logger = logging.getLogger(__name__)
-
-PROJECTS_ROOT = Path(os.environ.get("PROJECTS_DIR", "/home/lemon/claude-projects"))
 
 mcp = FastMCP(name="SlackTools")
 _client: AsyncWebClient | None = None
@@ -94,18 +92,10 @@ async def upload_to_slack(file_path: str, message: str = "") -> str:
     if not channel:
         return "오류: SLACK_CHANNEL 환경변수가 설정되지 않았습니다."
 
-    path = Path(file_path)
-
-    try:
-        path.resolve().relative_to(PROJECTS_ROOT.resolve())
-    except ValueError:
-        return f"오류: PROJECTS_DIR 디렉토리 밖의 파일은 업로드할 수 없습니다. (요청: {file_path})"
-
-    if not path.exists():
-        return f"오류: 파일을 찾을 수 없습니다. ({file_path})"
-
-    if not path.is_file():
-        return f"오류: 디렉토리는 업로드할 수 없습니다. ({file_path})"
+    result = validate_upload_path(file_path)
+    if isinstance(result, str):
+        return result
+    path = result
 
     client = _get_client()
     kwargs: dict = dict(
