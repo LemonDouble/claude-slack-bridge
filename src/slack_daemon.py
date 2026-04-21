@@ -708,17 +708,7 @@ class SlackDaemon:
         duration_s = result.duration_ms / 1000
         total_input = result.input_tokens + result.cache_read_tokens + result.cache_creation_tokens
 
-        # Claude Code 4.7+ can aggregate multiple models in modelUsage (e.g. Haiku
-        # for ai-title generation on a new session). Pick the model with the most
-        # output tokens — that's the one that actually produced the answer.
-        if result.model_usage:
-            primary = max(
-                result.model_usage.items(),
-                key=lambda kv: kv[1].get("outputTokens", 0),
-            )[0]
-            model_label = _format_model_name(primary)
-        else:
-            model_label = "Unknown"
+        model_label = _get_model_label(result.requested_model, result.model_usage)
 
         parts = [f":bar_chart: *{model_label}* | "]
         parts.append(f"Tokens In: `{total_input:,}` Out: `{result.output_tokens:,}`")
@@ -993,6 +983,18 @@ class EventPoster:
 
         self._last_post = time.monotonic()
         self._dirty = False
+
+
+def _get_model_label(requested: str, model_usage: dict[str, Any]) -> str:
+    """Return a display label using the requested model name.
+
+    Looks up the exact version from modelUsage keys (e.g. "opus" → "claude-opus-4-7" → "Opus 4.7").
+    Falls back to capitalizing the short name if modelUsage has no match.
+    """
+    for model_id in model_usage:
+        if requested and requested in model_id:
+            return _format_model_name(model_id)
+    return requested.capitalize() if requested else "Unknown"
 
 
 def _format_model_name(model_id: str) -> str:

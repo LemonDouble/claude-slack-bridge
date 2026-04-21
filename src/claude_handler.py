@@ -41,6 +41,7 @@ class ClaudeResult:
     cache_creation_tokens: int = 0
     duration_ms: int = 0
     model_usage: dict[str, Any] = field(default_factory=dict)
+    requested_model: str = ""
 
 DEFAULT_IDLE_TIMEOUT = 43200  # 12 hours
 PROJECTS_ROOT = Path(os.environ.get("PROJECTS_DIR", "/home/lemon/claude-projects"))
@@ -205,11 +206,13 @@ class ClaudeHandler:
         model = self.get_model(message_ts)
         effort = self.get_effort(message_ts)
         cmd = self._build_cmd(model=model, effort=effort)
-        return await self._run_claude(
+        result = await self._run_claude(
             cmd, text, cwd=project_dir, on_event=on_event,
             slack_channel=channel, slack_thread_ts=message_ts,
             thread_ts=message_ts,
         )
+        result.requested_model = model
+        return result
 
     async def handle_thread_reply(
         self, channel: str, thread_ts: str, text: str,
@@ -224,21 +227,25 @@ class ClaudeHandler:
         if session_id:
             logger.info("Resuming session %s for thread %s", session_id, thread_ts)
             cmd = self._build_cmd(resume=session_id, model=model, effort=effort)
-            return await self._run_claude(
+            result = await self._run_claude(
                 cmd, text, cwd=project_dir, on_event=on_event,
                 slack_channel=channel, slack_thread_ts=thread_ts,
                 thread_ts=thread_ts,
             )
+            result.requested_model = model
+            return result
 
         # Fallback: session lost (process restart) — use thread history as context.
         logger.info("No session for thread %s, falling back to thread history.", thread_ts)
         prompt = await self._build_thread_prompt(channel, thread_ts)
         cmd = self._build_cmd(model=model, effort=effort)
-        return await self._run_claude(
+        result = await self._run_claude(
             cmd, prompt, cwd=project_dir, on_event=on_event,
             slack_channel=channel, slack_thread_ts=thread_ts,
             thread_ts=thread_ts,
         )
+        result.requested_model = model
+        return result
 
     # ------------------------------------------------------------------
     # Internals
