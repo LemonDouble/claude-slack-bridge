@@ -599,8 +599,11 @@ class SlackDaemon:
                 channel, thread_ts, text, on_event=poster.handle_event,
             )
             progress_ts = await poster.flush()
-            await self._post_response(channel, thread_ts, result.text, progress_ts=progress_ts)
-            await self._post_usage_footer(channel, thread_ts, result)
+            usage_footer = self._format_usage_footer(result)
+            await self._post_response(
+                channel, thread_ts, result.text,
+                progress_ts=progress_ts, usage_footer=usage_footer,
+            )
             await self._remove_reaction(channel, react_ts, "hourglass_flowing_sand")
             await self._add_reaction(channel, react_ts, "white_check_mark")
         except Exception as exc:
@@ -647,10 +650,11 @@ class SlackDaemon:
         except Exception as post_exc:
             logger.warning("Failed to post error message: %s", post_exc)
 
-    async def _post_usage_footer(self, channel: str, thread_ts: str, result: ClaudeResult) -> None:
-        """Post a small usage/cost summary as a thread reply."""
+    @staticmethod
+    def _format_usage_footer(result: ClaudeResult) -> str:
+        """Format a usage/cost summary line. Returns empty string if no usage."""
         if result.total_cost_usd == 0 and result.input_tokens == 0:
-            return
+            return ""
 
         duration_s = result.duration_ms / 1000
         total_input = result.input_tokens + result.cache_read_tokens + result.cache_creation_tokens
@@ -665,13 +669,7 @@ class SlackDaemon:
         parts.append(f" | Cost: `${result.total_cost_usd:.4f}`")
         parts.append(f" | Time: `{duration_s:.1f}s`")
 
-        text = "".join(parts)
-        try:
-            await self._app.client.chat_postMessage(
-                channel=channel, thread_ts=thread_ts, text=text, mrkdwn=True,
-            )
-        except Exception as exc:
-            logger.warning("Failed to post usage footer: %s", exc)
+        return "".join(parts)
 
     @staticmethod
     def _markdown_to_slack(text: str) -> str:
@@ -732,7 +730,8 @@ class SlackDaemon:
             pass
 
     async def _post_response(
-        self, channel: str, thread_ts: str, text: str, *, progress_ts: str | None = None,
+        self, channel: str, thread_ts: str, text: str, *,
+        progress_ts: str | None = None, usage_footer: str = "",
     ) -> None:
         """Post a response to Slack, splitting if it exceeds the message length limit.
 
@@ -746,13 +745,15 @@ class SlackDaemon:
             await self._delete_progress(channel, progress_ts)
             return
 
+        footer_suffix = "\n\n" + usage_footer if usage_footer else ""
+
         chunks = self._split_message(text, SLACK_MAX_MESSAGE_LENGTH)
 
         # Single chunk — update progress message in-place if available
         if len(chunks) == 1 and progress_ts:
             try:
                 await self._app.client.chat_update(
-                    channel=channel, ts=progress_ts, text=chunks[0], mrkdwn=True,
+                    channel=channel, ts=progress_ts, text=chunks[0] + footer_suffix, mrkdwn=True,
                 )
                 return
             except Exception:
@@ -764,7 +765,7 @@ class SlackDaemon:
         if len(chunks) > 3:
             await self._app.client.chat_postMessage(
                 channel=channel, thread_ts=thread_ts,
-                text=text[:3000] + "\n\n_(전체 응답은 파일로 첨부되었습니다)_",
+                text=text[:3000] + "\n\n_(전체 응답은 파일로 첨부되었습니다)_" + footer_suffix,
                 mrkdwn=True,
             )
             await self._app.client.files_upload_v2(
@@ -774,7 +775,9 @@ class SlackDaemon:
             )
             return
 
-        for chunk in chunks:
+        for i, chunk in enumerate(chunks):
+            if i == len(chunks) - 1:
+                chunk += footer_suffix
             await self._app.client.chat_postMessage(
                 channel=channel, thread_ts=thread_ts, text=chunk, mrkdwn=True,
             )
