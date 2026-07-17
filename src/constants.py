@@ -15,9 +15,8 @@ CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
 VALID_MODELS = ("sonnet", "opus", "haiku")
 VALID_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 VALID_PERMISSION_MODES = ("auto", "acceptEdits", "bypassPermissions")
-DEFAULT_MODEL = "sonnet"
-DEFAULT_EFFORT = "high"
-DEFAULT_PERMISSION_MODE = "auto"
+# 설정 종류(kind)별 전역 기본값 — ClaudeHandler의 설정 레지스트리 키와 일치
+DEFAULT_SETTINGS = {"model": "sonnet", "effort": "high", "perm": "auto"}
 # Slack 승인 요청에 응답이 없으면 자동 거부까지 기다리는 시간
 APPROVAL_TIMEOUT_SECONDS = 600
 STATE_FILE = Path.home() / ".claude" / "slack-bridge-state.json"

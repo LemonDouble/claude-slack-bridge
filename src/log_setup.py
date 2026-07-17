@@ -2,7 +2,7 @@
 log_setup.py — 공통 로깅 설정.
 
 stdout에는 INFO 이상, error.log에는 ERROR 이상 기록.
-각 진입점(main.py, session.py, tools_mcp.py)에서 한 번만 호출.
+각 진입점(main.py, tools_mcp.py)에서 한 번만 호출.
 """
 
 import logging

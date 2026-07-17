@@ -18,16 +18,21 @@ import json
 import logging
 import os
 import signal
+from collections import deque
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from constants import (
-    STATE_FILE, PROJECTS_ROOT,
-    VALID_MODELS, VALID_EFFORTS, DEFAULT_MODEL, DEFAULT_EFFORT,
-    DEFAULT_PERMISSION_MODE,
-)
+from constants import STATE_FILE, PROJECTS_ROOT, DEFAULT_SETTINGS
+
+# 구버전 상태 파일의 설정별 개별 키 (마이그레이션용)
+_LEGACY_DEFAULT_KEYS = {
+    "model": "default_model", "effort": "default_effort", "perm": "default_permission_mode",
+}
+_LEGACY_THREAD_KEYS = {
+    "model": "thread_models", "effort": "thread_efforts", "perm": "thread_permission_modes",
+}
 
 OnEventFn = Callable[[dict[str, Any]], Coroutine[Any, Any, None]]
 # 권한 요청(can_use_tool request dict)을 받아 결정을 반환하는 콜백.
@@ -49,7 +54,6 @@ class ClaudeResult:
     duration_ms: int = 0
     model_usage: dict[str, Any] = field(default_factory=dict)
     requested_model: str = ""
-    permission_denials: list[dict[str, Any]] = field(default_factory=list)
 
 
 class ClaudeHandler:
@@ -67,19 +71,18 @@ class ClaudeHandler:
         self._sessions: dict[str, str] = {}  # thread_ts → session UUID
         self._thread_projects: dict[str, str] = {}  # thread_ts → project dir
         self._active_processes: dict[str, asyncio.subprocess.Process] = {}
-        self._default_model: str = DEFAULT_MODEL
-        self._default_effort: str = DEFAULT_EFFORT
-        self._default_perm: str = DEFAULT_PERMISSION_MODE
-        self._thread_models: dict[str, str] = {}   # thread_ts → model
-        self._thread_efforts: dict[str, str] = {}  # thread_ts → effort
-        self._thread_perms: dict[str, str] = {}    # thread_ts → permission mode
+        self._defaults: dict[str, str] = dict(DEFAULT_SETTINGS)  # kind → 전역 기본값
+        self._thread_settings: dict[str, dict[str, str]] = {  # kind → {thread_ts → 값}
+            kind: {} for kind in DEFAULT_SETTINGS
+        }
         self._load_state()
 
-    async def initialize(self) -> None:
-        """Cache the bot's own user ID."""
+    async def initialize(self) -> str:
+        """Cache the bot's own user ID and return it."""
         resp = await self._slack_client.auth_test()
         self._bot_user_id = resp["user_id"]
         logger.info("ClaudeHandler initialized, bot_user_id=%s", self._bot_user_id)
+        return self._bot_user_id
 
     # ------------------------------------------------------------------
     # State persistence
@@ -93,16 +96,20 @@ class ClaudeHandler:
             data = json.loads(STATE_FILE.read_text())
             self._thread_projects = data.get("thread_projects", {})
             self._sessions = data.get("sessions", {})
-            self._default_model = data.get("default_model", DEFAULT_MODEL)
-            self._default_effort = data.get("default_effort", DEFAULT_EFFORT)
-            self._default_perm = data.get("default_permission_mode", DEFAULT_PERMISSION_MODE)
-            self._thread_models = data.get("thread_models", {})
-            self._thread_efforts = data.get("thread_efforts", {})
-            self._thread_perms = data.get("thread_permission_modes", {})
+            for kind in DEFAULT_SETTINGS:
+                self._defaults[kind] = (
+                    data.get("defaults", {}).get(kind)
+                    or data.get(_LEGACY_DEFAULT_KEYS[kind])
+                    or DEFAULT_SETTINGS[kind]
+                )
+                self._thread_settings[kind] = (
+                    data.get("thread_settings", {}).get(kind)
+                    or data.get(_LEGACY_THREAD_KEYS[kind])
+                    or {}
+                )
             logger.info(
-                "Restored state: %d threads, %d sessions, default=%s/%s.",
-                len(self._thread_projects), len(self._sessions),
-                self._default_model, self._default_effort,
+                "Restored state: %d threads, %d sessions, defaults=%s.",
+                len(self._thread_projects), len(self._sessions), self._defaults,
             )
         except Exception as exc:
             logger.warning("Failed to load state: %s", exc)
@@ -114,12 +121,8 @@ class ClaudeHandler:
             STATE_FILE.write_text(json.dumps({
                 "thread_projects": self._thread_projects,
                 "sessions": self._sessions,
-                "default_model": self._default_model,
-                "default_effort": self._default_effort,
-                "default_permission_mode": self._default_perm,
-                "thread_models": self._thread_models,
-                "thread_efforts": self._thread_efforts,
-                "thread_permission_modes": self._thread_perms,
+                "defaults": self._defaults,
+                "thread_settings": self._thread_settings,
             }))
         except Exception as exc:
             logger.warning("Failed to save state: %s", exc)
@@ -160,62 +163,26 @@ class ClaudeHandler:
         return str(project_dir)
 
     # ------------------------------------------------------------------
-    # Model / effort settings
+    # Settings (kind: "model" | "effort" | "perm")
     # ------------------------------------------------------------------
 
-    def get_model(self, thread_ts: str) -> str:
-        """Return the model for a thread (falls back to global default)."""
-        return self._thread_models.get(thread_ts, self._default_model)
+    def get_setting(self, thread_ts: str, kind: str) -> str:
+        """스레드 설정 값을 반환한다 (없으면 전역 기본값)."""
+        return self._thread_settings[kind].get(thread_ts, self._defaults[kind])
 
-    def get_effort(self, thread_ts: str) -> str:
-        """Return the effort level for a thread (falls back to global default)."""
-        return self._thread_efforts.get(thread_ts, self._default_effort)
-
-    def set_thread_model(self, thread_ts: str, model: str) -> None:
-        """Set the model for a specific thread."""
-        self._thread_models[thread_ts] = model
+    def set_setting(self, thread_ts: str, kind: str, value: str) -> None:
+        """스레드 설정 값을 저장한다 (영속)."""
+        self._thread_settings[kind][thread_ts] = value
         self._save_state()
 
-    def set_thread_effort(self, thread_ts: str, effort: str) -> None:
-        """Set the effort level for a specific thread."""
-        self._thread_efforts[thread_ts] = effort
+    def get_default(self, kind: str) -> str:
+        """전역 기본값을 반환한다."""
+        return self._defaults[kind]
+
+    def set_default(self, kind: str, value: str) -> None:
+        """전역 기본값을 저장한다 (영속)."""
+        self._defaults[kind] = value
         self._save_state()
-
-    def get_permission_mode(self, thread_ts: str) -> str:
-        """Return the permission mode for a thread (falls back to global default)."""
-        return self._thread_perms.get(thread_ts, self._default_perm)
-
-    def set_thread_permission_mode(self, thread_ts: str, mode: str) -> None:
-        """Set the permission mode for a specific thread."""
-        self._thread_perms[thread_ts] = mode
-        self._save_state()
-
-    def set_default_model(self, model: str) -> None:
-        """Set the global default model (persisted)."""
-        self._default_model = model
-        self._save_state()
-
-    def set_default_effort(self, effort: str) -> None:
-        """Set the global default effort level (persisted)."""
-        self._default_effort = effort
-        self._save_state()
-
-    def set_default_permission_mode(self, mode: str) -> None:
-        """Set the global default permission mode (persisted)."""
-        self._default_perm = mode
-        self._save_state()
-
-    @property
-    def default_model(self) -> str:
-        return self._default_model
-
-    @property
-    def default_effort(self) -> str:
-        return self._default_effort
-
-    @property
-    def default_permission_mode(self) -> str:
-        return self._default_perm
 
     # ------------------------------------------------------------------
     # Public API
@@ -229,9 +196,9 @@ class ClaudeHandler:
         """Handle a threaded reply (resume existing session or fallback)."""
         session_id = self._sessions.get(thread_ts)
         project_dir = self._thread_projects.get(thread_ts)
-        model = self.get_model(thread_ts)
-        effort = self.get_effort(thread_ts)
-        perm = self.get_permission_mode(thread_ts)
+        model = self.get_setting(thread_ts, "model")
+        effort = self.get_setting(thread_ts, "effort")
+        perm = self.get_setting(thread_ts, "perm")
 
         if session_id:
             logger.info("Resuming session %s for thread %s", session_id, thread_ts)
@@ -273,11 +240,11 @@ class ClaudeHandler:
 
     @staticmethod
     def _build_cmd(
+        model: str,
+        effort: str,
+        permission_mode: str,
         resume: str | None = None,
-        model: str = DEFAULT_MODEL,
-        effort: str = DEFAULT_EFFORT,
         name: str | None = None,
-        permission_mode: str = DEFAULT_PERMISSION_MODE,
     ) -> list[str]:
         project_root = str(Path(__file__).resolve().parent.parent)
         tools_mcp_path = str(Path(__file__).resolve().parent / "tools_mcp.py")
@@ -431,9 +398,12 @@ class ClaudeHandler:
             except Exception as exc:
                 logger.warning("Failed to send control_response: %s", exc)
 
-        # Stream stdout line-by-line with an idle timeout.
-        lines: list[str] = []
-        result_seen = False
+        # Stream stdout line-by-line with an idle timeout. 이벤트는 이 자리에서
+        # 바로 해석하고, 에러 로깅용으로는 마지막 일부 라인만 남긴다 (몇 시간짜리
+        # 작업의 전체 stdout을 메모리에 들고 있지 않기 위함).
+        tail: deque[str] = deque(maxlen=50)
+        result_event: dict[str, Any] | None = None
+        text_parts: list[str] = []  # result 이벤트가 없을 때의 폴백용 assistant 텍스트
         assert process.stdout is not None
         try:
             while True:
@@ -452,13 +422,10 @@ class ClaudeHandler:
                 if not line_bytes:  # EOF
                     break
 
-                line_str = line_bytes.decode("utf-8", errors="replace")
-                lines.append(line_str)
-
-                # Parse event and capture session ID.
-                stripped = line_str.strip()
+                stripped = line_bytes.decode("utf-8", errors="replace").strip()
                 if not stripped:
                     continue
+                tail.append(stripped)
                 try:
                     event = json.loads(stripped)
                 except json.JSONDecodeError:
@@ -483,6 +450,12 @@ class ClaudeHandler:
                     self._sessions[thread_ts] = event["session_id"]
                     self._save_state()
                     logger.info("Captured session %s for thread %s", event["session_id"], thread_ts)
+
+                if event.get("type") == "assistant":
+                    for block in event.get("message", {}).get("content", []):
+                        if isinstance(block, dict) and block.get("type") == "text":
+                            text_parts.append(block["text"])
+
                 if on_event:
                     try:
                         await on_event(event)
@@ -492,7 +465,7 @@ class ClaudeHandler:
                 # stream-json 입력 모드에서는 result 후에도 프로세스가 다음
                 # 입력을 기다리므로, result를 받으면 턴을 종료시킨다.
                 if event.get("type") == "result":
-                    result_seen = True
+                    result_event = event
                     break
 
         except Exception:
@@ -516,65 +489,33 @@ class ClaudeHandler:
             process.kill()
             await process.wait()
 
-        if not result_seen and process.returncode != 0:
+        if result_event is None and process.returncode != 0:
             stderr_bytes = await process.stderr.read() if process.stderr else b""
             stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
-            stdout_text = "".join(lines).strip()
             logger.error(
-                "Claude CLI failed (rc=%d) stderr: %s | stdout: %s | cmd: %s | prompt: %r",
-                process.returncode, stderr_text, stdout_text, cmd, prompt[:200],
+                "Claude CLI failed (rc=%d) stderr: %s | stdout tail: %s | cmd: %s | prompt: %r",
+                process.returncode, stderr_text, "\n".join(tail), cmd, prompt[:200],
             )
             return ClaudeResult(text="죄송합니다. 요청 처리 중 오류가 발생했습니다.")
 
-        return self._parse_stream_response(lines)
+        return self._make_result(result_event, text_parts)
 
     @staticmethod
-    def _parse_stream_response(lines: list[str]) -> ClaudeResult:
-        """Extract the final result text and usage stats from stream-json output.
-
-        ``stream-json`` emits one JSON object per line.  The final message
-        with ``"type": "result"`` contains the ``"result"`` field we need.
-        Falls back to collecting all ``assistant`` message text blocks.
-        """
-        result_text: str | None = None
-        result_event: dict[str, Any] | None = None
-        text_parts: list[str] = []
-
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-
-            # The final "result" event carries the complete answer.
-            if event.get("type") == "result":
-                result_text = event.get("result", "")
-                result_event = event
-                break
-
-            # Accumulate assistant text blocks as fallback.
-            if event.get("type") == "assistant" and "message" in event:
-                for block in event["message"].get("content", []):
-                    if isinstance(block, dict) and block.get("type") == "text":
-                        text_parts.append(block["text"])
-
+    def _make_result(result_event: dict[str, Any] | None, text_parts: list[str]) -> ClaudeResult:
+        """result 이벤트(없으면 assistant 텍스트 폴백)로 ClaudeResult를 만든다."""
+        result_text = result_event.get("result", "") if result_event else None
         if result_text is not None:
             text = result_text
         elif text_parts:
             text = "\n\n".join(text_parts)
         else:
-            text = "".join(lines).strip()
+            text = ""
 
-        # Extract usage stats from the result event.
         cr = ClaudeResult(text=text)
         if result_event:
             cr.total_cost_usd = result_event.get("total_cost_usd", 0.0)
             cr.duration_ms = result_event.get("duration_ms", 0)
             cr.model_usage = result_event.get("modelUsage", {})
-            cr.permission_denials = result_event.get("permission_denials", []) or []
             usage = result_event.get("usage", {})
             cr.input_tokens = usage.get("input_tokens", 0)
             cr.output_tokens = usage.get("output_tokens", 0)

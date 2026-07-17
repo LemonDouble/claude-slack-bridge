@@ -18,6 +18,7 @@ import logging
 import re
 import uuid
 from collections import deque
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +39,13 @@ logger = logging.getLogger(__name__)
 
 _MAX_FOLDER_BUTTONS = 40
 _SESSION_LIST_LIMIT = 5
+
+# !model / !effort / !perm / !default 처리용: kind → (표시 이름, 허용 값)
+_SETTINGS: dict[str, tuple[str, tuple[str, ...]]] = {
+    "model": ("모델", VALID_MODELS),
+    "effort": ("effort", VALID_EFFORTS),
+    "perm": ("권한 모드", VALID_PERMISSION_MODES),
+}
 
 
 class SlackDaemon:
@@ -218,16 +226,10 @@ class SlackDaemon:
         text: str = event.get("text", "")
         channel: str = event.get("channel", "")
         files: list[dict] = event.get("files", [])
-        logger.info("Message event keys: %s, has files: %d, subtype: %s, text: %r, bot_id: %s, display_as_bot: %s, thread_ts: %s",
-                     list(event.keys()), len(files), event.get("subtype"), text[:100],
-                     event.get("bot_id"), event.get("display_as_bot"), thread_ts)
 
         # Case 1: Threaded reply — continue the Claude conversation for that thread.
         if thread_ts:
-            project = self._claude.get_thread_project(thread_ts)
-            logger.info("Thread %s project lookup: %s (known projects: %s)",
-                        thread_ts, project, list(self._claude._thread_projects.keys()))
-            if not project:
+            if not self._claude.get_thread_project(thread_ts):
                 return
             message_ts = event.get("ts", thread_ts)
 
@@ -251,7 +253,7 @@ class SlackDaemon:
                     status_ts = resp["ts"]
                 except Exception:
                     status_ts = None
-                queue.append((channel, thread_ts, text, message_ts, status_ts))
+                queue.append((channel, text, message_ts, status_ts))
                 return
             asyncio.create_task(self._handle_claude_thread_reply(channel, thread_ts, text, message_ts))
             return
@@ -389,9 +391,9 @@ class SlackDaemon:
             blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": summary}}],
         )
 
-        model = self._claude.get_model(ts)
-        effort = self._claude.get_effort(ts)
-        perm = self._claude.get_permission_mode(ts)
+        model = self._claude.get_setting(ts, "model")
+        effort = self._claude.get_setting(ts, "effort")
+        perm = self._claude.get_setting(ts, "perm")
         intro = "이어서 무엇을 할까요?" if session_id else "무엇을 도와드릴까요?"
         await self._app.client.chat_postMessage(
             channel=channel,
@@ -499,27 +501,8 @@ class SlackDaemon:
         cmd = parts[0].lower()
         arg = parts[1].strip().lower() if len(parts) > 1 else ""
 
-        if cmd == "!model":
-            return await self._cmd_change_setting(
-                channel, thread_ts, message_ts, arg,
-                name="모델", cmd="model", valid=VALID_MODELS,
-                get_current="get_model", set_value="set_thread_model",
-                get_default="default_model",
-            )
-        if cmd == "!effort":
-            return await self._cmd_change_setting(
-                channel, thread_ts, message_ts, arg,
-                name="effort", cmd="effort", valid=VALID_EFFORTS,
-                get_current="get_effort", set_value="set_thread_effort",
-                get_default="default_effort",
-            )
-        if cmd == "!perm":
-            return await self._cmd_change_setting(
-                channel, thread_ts, message_ts, arg,
-                name="권한 모드", cmd="perm", valid=VALID_PERMISSION_MODES,
-                get_current="get_permission_mode", set_value="set_thread_permission_mode",
-                get_default="default_permission_mode",
-            )
+        if cmd[1:] in _SETTINGS:
+            return await self._cmd_change_setting(channel, thread_ts, message_ts, cmd[1:], arg)
         if cmd in ("!settings", "!help"):
             return await self._cmd_settings(channel, thread_ts)
         if cmd == "!default":
@@ -530,23 +513,20 @@ class SlackDaemon:
         return False
 
     async def _cmd_change_setting(
-        self, channel: str, thread_ts: str, message_ts: str, arg: str,
-        *, name: str, cmd: str, valid: tuple[str, ...],
-        get_current: str, set_value: str, get_default: str,
+        self, channel: str, thread_ts: str, message_ts: str, kind: str, arg: str,
     ) -> bool:
-        """!model / !effort 공통 핸들러. get_current/set_value/get_default는 ClaudeHandler 메서드명."""
-        getter = getattr(self._claude, get_current)
-        setter = getattr(self._claude, set_value)
-        default = getattr(self._claude, get_default)
+        """!model / !effort / !perm 공통 핸들러."""
+        name, valid = _SETTINGS[kind]
         options = " | ".join(valid)
 
         if not arg:
             await self._app.client.chat_postMessage(
                 channel=channel, thread_ts=thread_ts,
                 text=(
-                    f":gear: 현재 {name}: *{getter(thread_ts)}* (기본값: *{default}*)\n"
-                    f"사용법: `!{cmd} {options}`\n"
-                    f"기본값 변경: `!default {cmd} {options}`"
+                    f":gear: 현재 {name}: *{self._claude.get_setting(thread_ts, kind)}*"
+                    f" (기본값: *{self._claude.get_default(kind)}*)\n"
+                    f"사용법: `!{kind} {options}`\n"
+                    f"기본값 변경: `!default {kind} {options}`"
                 ),
                 mrkdwn=True,
             )
@@ -560,7 +540,7 @@ class SlackDaemon:
                 mrkdwn=True,
             )
             return True
-        setter(thread_ts, canon)
+        self._claude.set_setting(thread_ts, kind, canon)
         await self._add_reaction(channel, message_ts, "white_check_mark")
         await self._app.client.chat_postMessage(
             channel=channel, thread_ts=thread_ts,
@@ -597,12 +577,12 @@ class SlackDaemon:
         return True
 
     async def _cmd_settings(self, channel: str, thread_ts: str) -> bool:
-        model = self._claude.get_model(thread_ts)
-        effort = self._claude.get_effort(thread_ts)
-        perm = self._claude.get_permission_mode(thread_ts)
-        default_model = self._claude.default_model
-        default_effort = self._claude.default_effort
-        default_perm = self._claude.default_permission_mode
+        model = self._claude.get_setting(thread_ts, "model")
+        effort = self._claude.get_setting(thread_ts, "effort")
+        perm = self._claude.get_setting(thread_ts, "perm")
+        default_model = self._claude.get_default("model")
+        default_effort = self._claude.get_default("effort")
+        default_perm = self._claude.get_default("perm")
         project_dir = self._claude.get_thread_project(thread_ts) or "(미지정)"
         session_id = self._claude.get_thread_session(thread_ts)
         text = (
@@ -635,7 +615,7 @@ class SlackDaemon:
     ) -> bool:
         """Handle !default model <val> or !default effort <val>."""
         parts = arg.split(None, 1)
-        if len(parts) != 2 or parts[0] not in ("model", "effort", "perm"):
+        if len(parts) != 2 or parts[0] not in _SETTINGS:
             await self._app.client.chat_postMessage(
                 channel=channel, thread_ts=thread_ts,
                 text=":warning: 사용법: `!default model sonnet` / `!default effort high` / `!default perm auto`",
@@ -644,11 +624,7 @@ class SlackDaemon:
             return True
 
         kind, value = parts[0], parts[1].strip()
-        valid, setter, label = {
-            "model":  (VALID_MODELS,  self._claude.set_default_model,  "모델"),
-            "effort": (VALID_EFFORTS, self._claude.set_default_effort, "effort"),
-            "perm":   (VALID_PERMISSION_MODES, self._claude.set_default_permission_mode, "권한 모드"),
-        }[kind]
+        name, valid = _SETTINGS[kind]
 
         canon = next((v for v in valid if v.lower() == value.lower()), None)
         if canon is None:
@@ -659,11 +635,11 @@ class SlackDaemon:
             )
             return True
 
-        setter(canon)
+        self._claude.set_default(kind, canon)
         await self._add_reaction(channel, message_ts, "white_check_mark")
         await self._app.client.chat_postMessage(
             channel=channel, thread_ts=thread_ts,
-            text=f":gear: 기본 {label}이(가) *{canon}*(으)로 변경되었습니다.", mrkdwn=True,
+            text=f":gear: 기본 {name}이(가) *{canon}*(으)로 변경되었습니다.", mrkdwn=True,
         )
         return True
 
@@ -702,18 +678,61 @@ class SlackDaemon:
             summary = summary[:497] + "…"
         return summary or "(입력 없음)"
 
-    async def _finish_approval_message(
-        self, channel: str, ts: str, tool_name: str, summary: str, outcome: str,
-    ) -> None:
-        """승인 메시지의 버튼을 제거하고 결과를 표시한다."""
-        text = f":lock: *{tool_name}*\n```{summary}```\n{outcome}"
+    async def _replace_message(self, channel: str, ts: str, text: str) -> None:
+        """메시지의 블록(버튼)을 제거하고 텍스트로 교체한다."""
         try:
             await self._app.client.chat_update(
                 channel=channel, ts=ts, text=text,
                 blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": text}}],
             )
         except Exception as exc:
-            logger.warning("Failed to update approval message: %s", exc)
+            logger.warning("Failed to update interactive message: %s", exc)
+
+    async def _post_buttons_and_wait(
+        self, channel: str, thread_ts: str, *,
+        approval_id: str, text: str, blocks: list[dict],
+        finish_base: str, timeout_outcome: str,
+        outcome: Callable[[Any, str], str],
+    ) -> Any | None:
+        """버튼 메시지를 게시하고 클릭(또는 타임아웃)을 기다린다.
+
+        클릭 시 버튼을 결과 텍스트로 교체하고 future의 결과값을 반환한다.
+        타임아웃 시 timeout_outcome을 표시하고 None을 반환한다.
+        작업 중단으로 대기가 취소되면 메시지를 무효화 표시 후 CancelledError를 다시 던진다.
+        outcome은 (결과값, 사용자 멘션)을 받아 결과 표시 텍스트를 만든다.
+        """
+        future: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._pending_approvals[approval_id] = future
+        msg_ts: str | None = None
+
+        try:
+            resp = await self._app.client.chat_postMessage(
+                channel=channel, thread_ts=thread_ts, text=text, blocks=blocks,
+            )
+            msg_ts = resp["ts"]
+            try:
+                result, user_id = await asyncio.wait_for(
+                    future, timeout=APPROVAL_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                await self._replace_message(channel, msg_ts, f"{finish_base}\n{timeout_outcome}")
+                return None
+            who = f"<@{user_id}>" if user_id else "사용자"
+            await self._replace_message(channel, msg_ts, f"{finish_base}\n{outcome(result, who)}")
+            return result
+        except asyncio.CancelledError:
+            # 작업 중단/프로세스 종료로 대기가 취소된 경우
+            if msg_ts:
+                try:
+                    await asyncio.shield(self._replace_message(
+                        channel, msg_ts,
+                        f"{finish_base}\n:heavy_minus_sign: 작업이 종료되어 무효화되었습니다.",
+                    ))
+                except Exception:
+                    pass
+            raise
+        finally:
+            self._pending_approvals.pop(approval_id, None)
 
     async def _request_permission(
         self, channel: str, thread_ts: str, request: dict[str, Any],
@@ -729,87 +748,60 @@ class SlackDaemon:
         summary = self._format_permission_summary(tool_name, request.get("input", {}))
 
         approval_id = uuid.uuid4().hex[:12]
-        future: asyncio.Future = asyncio.get_running_loop().create_future()
-        self._pending_approvals[approval_id] = future
-
-        resp = await self._app.client.chat_postMessage(
-            channel=channel, thread_ts=thread_ts,
-            text=f"승인 필요: {tool_name} — {summary[:100]}",
-            blocks=[
-                {
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": f":lock: *승인이 필요합니다* — *{tool_name}*\n```{summary}```",
+        blocks = [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f":lock: *승인이 필요합니다* — *{tool_name}*\n```{summary}```",
+                },
+            },
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "✅ 승인", "emoji": True},
+                        "action_id": "perm_allow",
+                        "value": approval_id,
+                        "style": "primary",
                     },
-                },
-                {
-                    "type": "actions",
-                    "elements": [
-                        {
-                            "type": "button",
-                            "text": {"type": "plain_text", "text": "✅ 승인", "emoji": True},
-                            "action_id": "perm_allow",
-                            "value": approval_id,
-                            "style": "primary",
-                        },
-                        {
-                            "type": "button",
-                            "text": {"type": "plain_text", "text": "🚫 거부", "emoji": True},
-                            "action_id": "perm_deny",
-                            "value": approval_id,
-                            "style": "danger",
-                        },
-                    ],
-                },
-            ],
-        )
-        msg_ts = resp["ts"]
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "🚫 거부", "emoji": True},
+                        "action_id": "perm_deny",
+                        "value": approval_id,
+                        "style": "danger",
+                    },
+                ],
+            },
+        ]
         logger.info("Permission request %s posted for thread %s: %s %s",
                     approval_id, thread_ts, tool_name, summary[:100])
 
-        try:
-            try:
-                allowed, user_id = await asyncio.wait_for(
-                    future, timeout=APPROVAL_TIMEOUT_SECONDS,
-                )
-            except asyncio.TimeoutError:
-                await self._finish_approval_message(
-                    channel, msg_ts, tool_name, summary,
-                    f":hourglass: {APPROVAL_TIMEOUT_SECONDS // 60}분 내 응답이 없어 자동 거부되었습니다.",
-                )
-                return {
-                    "behavior": "deny",
-                    "message": "Slack에서 제한 시간 내 승인을 받지 못했습니다. "
-                               "다른 방법으로 진행하거나 사용자에게 확인하세요.",
-                }
-            who = f"<@{user_id}>" if user_id else "사용자"
-            if allowed:
-                await self._finish_approval_message(
-                    channel, msg_ts, tool_name, summary,
-                    f":white_check_mark: {who} 승인",
-                )
-                return {"behavior": "allow"}
-            await self._finish_approval_message(
-                channel, msg_ts, tool_name, summary,
-                f":no_entry_sign: {who} 거부",
-            )
+        allowed = await self._post_buttons_and_wait(
+            channel, thread_ts,
+            approval_id=approval_id,
+            text=f"승인 필요: {tool_name} — {summary[:100]}",
+            blocks=blocks,
+            finish_base=f":lock: *{tool_name}*\n```{summary}```",
+            timeout_outcome=f":hourglass: {APPROVAL_TIMEOUT_SECONDS // 60}분 내 응답이 없어 자동 거부되었습니다.",
+            outcome=lambda allowed, who: (
+                f":white_check_mark: {who} 승인" if allowed else f":no_entry_sign: {who} 거부"
+            ),
+        )
+        if allowed is None:
             return {
                 "behavior": "deny",
-                "message": "사용자가 Slack에서 이 작업을 거부했습니다.",
+                "message": "Slack에서 제한 시간 내 승인을 받지 못했습니다. "
+                           "다른 방법으로 진행하거나 사용자에게 확인하세요.",
             }
-        except asyncio.CancelledError:
-            # 작업 중단/프로세스 종료로 승인 대기가 취소된 경우
-            try:
-                await asyncio.shield(self._finish_approval_message(
-                    channel, msg_ts, tool_name, summary,
-                    ":heavy_minus_sign: 작업이 종료되어 무효화되었습니다.",
-                ))
-            except Exception:
-                pass
-            raise
-        finally:
-            self._pending_approvals.pop(approval_id, None)
+        if allowed:
+            return {"behavior": "allow"}
+        return {
+            "behavior": "deny",
+            "message": "사용자가 Slack에서 이 작업을 거부했습니다.",
+        }
 
     async def _handle_perm_decision(self, ack: Any, body: dict[str, Any]) -> None:
         """승인/거부 버튼 클릭 — 대기 중인 승인 future를 resolve한다."""
@@ -860,9 +852,6 @@ class SlackDaemon:
         options = q.get("options", [])
 
         approval_id = uuid.uuid4().hex[:12]
-        future: asyncio.Future = asyncio.get_running_loop().create_future()
-        self._pending_approvals[approval_id] = future
-
         title = f":speech_balloon: *{question}*"
         if header:
             title = f":speech_balloon: *[{header}]* {question}"
@@ -896,52 +885,19 @@ class SlackDaemon:
             ],
         })
 
-        resp = await self._app.client.chat_postMessage(
-            channel=channel, thread_ts=thread_ts,
-            text=f"질문: {question}", blocks=blocks,
-        )
-        msg_ts = resp["ts"]
         logger.info("Question %s posted for thread %s: %s", approval_id, thread_ts, question[:80])
-
-        try:
-            try:
-                label, user_id = await asyncio.wait_for(
-                    future, timeout=APPROVAL_TIMEOUT_SECONDS,
-                )
-            except asyncio.TimeoutError:
-                await self._finish_question_message(
-                    channel, msg_ts, title,
-                    f":hourglass: {APPROVAL_TIMEOUT_SECONDS // 60}분 내 응답이 없었습니다. 스레드에 답장으로 답변해 주세요.",
-                )
-                return None
-            who = f"<@{user_id}>" if user_id else "사용자"
-            await self._finish_question_message(
-                channel, msg_ts, title, f":white_check_mark: {who} 답변: *{label}*",
-            )
-            return label
-        except asyncio.CancelledError:
-            try:
-                await asyncio.shield(self._finish_question_message(
-                    channel, msg_ts, title, ":heavy_minus_sign: 작업이 종료되어 무효화되었습니다.",
-                ))
-            except Exception:
-                pass
-            raise
-        finally:
-            self._pending_approvals.pop(approval_id, None)
-
-    async def _finish_question_message(
-        self, channel: str, ts: str, title: str, outcome: str,
-    ) -> None:
-        """질문 메시지의 버튼을 제거하고 결과를 표시한다."""
-        text = f"{title}\n{outcome}"
-        try:
-            await self._app.client.chat_update(
-                channel=channel, ts=ts, text=text,
-                blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": text}}],
-            )
-        except Exception as exc:
-            logger.warning("Failed to update question message: %s", exc)
+        return await self._post_buttons_and_wait(
+            channel, thread_ts,
+            approval_id=approval_id,
+            text=f"질문: {question}",
+            blocks=blocks,
+            finish_base=title,
+            timeout_outcome=(
+                f":hourglass: {APPROVAL_TIMEOUT_SECONDS // 60}분 내 응답이 없었습니다. "
+                "스레드에 답장으로 답변해 주세요."
+            ),
+            outcome=lambda label, who: f":white_check_mark: {who} 답변: *{label}*",
+        )
 
     async def _handle_question_answer(self, ack: Any, body: dict[str, Any]) -> None:
         """질문 옵션 버튼 클릭 — 선택된 label로 future를 resolve한다."""
@@ -955,12 +911,8 @@ class SlackDaemon:
         future.set_result((data["label"], user_id))
 
     # ------------------------------------------------------------------
-    # Stream event formatting
+    # Claude turn lifecycle
     # ------------------------------------------------------------------
-
-    def _make_event_poster(self, channel: str, thread_ts: str) -> "EventPoster":
-        """Create an EventPoster that formats and posts Claude stream events."""
-        return EventPoster(self._app.client, channel, thread_ts)
 
     async def _handle_claude_thread_reply(self, channel: str, thread_ts: str, text: str, message_ts: str | None = None) -> None:
         """Spawn Claude for a thread reply and post the response."""
@@ -968,7 +920,7 @@ class SlackDaemon:
         logger.info("Handling thread reply: thread=%s, react_ts=%s, channel=%s", thread_ts, react_ts, channel)
         self._active_threads.add(thread_ts)
         await self._add_reaction(channel, react_ts, "hourglass_flowing_sand")
-        poster = self._make_event_poster(channel, thread_ts)
+        poster = EventPoster(self._app.client, channel, thread_ts)
 
         # 승인/질문 메시지가 진행 메시지보다 아래에 게시되므로, 인터랙션이
         # 있었던 턴은 최종 응답을 in-place로 바꾸면 시간 순서가 뒤집힌다.
@@ -1010,7 +962,7 @@ class SlackDaemon:
         channel = queue[0][0]
         texts: list[str] = []
         last_message_ts: str | None = None
-        for _ch, _ts, text, msg_ts, status_ts in queue:
+        for _ch, text, msg_ts, status_ts in queue:
             texts.append(text)
             last_message_ts = msg_ts
             await self._remove_reaction(_ch, msg_ts, "eyes")
@@ -1179,6 +1131,5 @@ class SlackDaemon:
 
     async def start(self) -> None:
         """Start the Slack Socket Mode handler."""
-        await self._claude.initialize()
-        self._bot_user_id = self._claude._bot_user_id
+        self._bot_user_id = await self._claude.initialize()
         await self._handler.start_async()
