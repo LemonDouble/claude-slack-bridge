@@ -209,6 +209,7 @@ dependencies = [
     { name = "aiohttp" },
     { name = "fastmcp" },
     { name = "pydantic-settings" },
+    { name = "python-dotenv" },
     { name = "slack-bolt" },
 ]
 
@@ -217,6 +218,7 @@ requires-dist = [
     { name = "aiohttp", specifier = ">=3.13.5" },
     { name = "fastmcp", specifier = ">=3.2.0" },
     { name = "pydantic-settings", specifier = ">=2.13.1" },
+    { name = "python-dotenv", specifier = ">=1.0.0" },
     { name = "slack-bolt", extras = ["async"], specifier = ">=1.27.0" },
 ]
 

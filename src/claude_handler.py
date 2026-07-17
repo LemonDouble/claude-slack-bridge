@@ -8,9 +8,9 @@ full context (tool use, reasoning) across messages in the same thread.
 If the session ID is lost (e.g. process restart), falls back to a one-shot
 ``claude -p`` with the formatted thread history as the prompt.
 
-Project detection: scans PROJECTS_DIR for 1-depth subdirectories.  Each
-subdirectory is treated as a separate project.  The project for each thread
-is selected via Slack Block Kit interactions and tracked per thread_ts.
+The project (working directory) for each thread is selected via the Slack
+folder-browser UI and tracked per thread_ts.  Any folder under PROJECTS_DIR
+— at any depth — can be a project.
 """
 
 import asyncio
@@ -26,9 +26,13 @@ from typing import Any
 from constants import (
     STATE_FILE, PROJECTS_ROOT,
     VALID_MODELS, VALID_EFFORTS, DEFAULT_MODEL, DEFAULT_EFFORT,
+    DEFAULT_PERMISSION_MODE,
 )
 
 OnEventFn = Callable[[dict[str, Any]], Coroutine[Any, Any, None]]
+# 권한 요청(can_use_tool request dict)을 받아 결정을 반환하는 콜백.
+# 반환값: {"behavior": "allow", "updatedInput": {...}} 또는 {"behavior": "deny", "message": "..."}
+OnPermissionFn = Callable[[dict[str, Any]], Coroutine[Any, Any, dict[str, Any]]]
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +49,7 @@ class ClaudeResult:
     duration_ms: int = 0
     model_usage: dict[str, Any] = field(default_factory=dict)
     requested_model: str = ""
+    permission_denials: list[dict[str, Any]] = field(default_factory=list)
 
 
 class ClaudeHandler:
@@ -64,8 +69,10 @@ class ClaudeHandler:
         self._active_processes: dict[str, asyncio.subprocess.Process] = {}
         self._default_model: str = DEFAULT_MODEL
         self._default_effort: str = DEFAULT_EFFORT
+        self._default_perm: str = DEFAULT_PERMISSION_MODE
         self._thread_models: dict[str, str] = {}   # thread_ts → model
         self._thread_efforts: dict[str, str] = {}  # thread_ts → effort
+        self._thread_perms: dict[str, str] = {}    # thread_ts → permission mode
         self._load_state()
 
     async def initialize(self) -> None:
@@ -88,8 +95,10 @@ class ClaudeHandler:
             self._sessions = data.get("sessions", {})
             self._default_model = data.get("default_model", DEFAULT_MODEL)
             self._default_effort = data.get("default_effort", DEFAULT_EFFORT)
+            self._default_perm = data.get("default_permission_mode", DEFAULT_PERMISSION_MODE)
             self._thread_models = data.get("thread_models", {})
             self._thread_efforts = data.get("thread_efforts", {})
+            self._thread_perms = data.get("thread_permission_modes", {})
             logger.info(
                 "Restored state: %d threads, %d sessions, default=%s/%s.",
                 len(self._thread_projects), len(self._sessions),
@@ -107,30 +116,24 @@ class ClaudeHandler:
                 "sessions": self._sessions,
                 "default_model": self._default_model,
                 "default_effort": self._default_effort,
+                "default_permission_mode": self._default_perm,
                 "thread_models": self._thread_models,
                 "thread_efforts": self._thread_efforts,
+                "thread_permission_modes": self._thread_perms,
             }))
         except Exception as exc:
             logger.warning("Failed to save state: %s", exc)
 
     # ------------------------------------------------------------------
-    # Project scanning
+    # Project (working directory) mapping
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def scan_projects() -> list[str]:
-        """Return sorted list of project directory names under /projects."""
-        if not PROJECTS_ROOT.exists():
-            logger.warning("Projects root %s does not exist.", PROJECTS_ROOT)
-            return []
-        return sorted(
-            d.name for d in PROJECTS_ROOT.iterdir()
-            if d.is_dir() and not d.name.startswith(".")
-        )
+    def set_thread_project(self, thread_ts: str, rel_path: str) -> str:
+        """Associate a thread with a folder under PROJECTS_ROOT (any depth).
 
-    def set_thread_project(self, thread_ts: str, project_name: str) -> str:
-        """Associate a thread with a project. Returns the full project path."""
-        project_dir = str(PROJECTS_ROOT / project_name)
+        Returns the full project path.
+        """
+        project_dir = str(PROJECTS_ROOT / rel_path) if rel_path else str(PROJECTS_ROOT)
         self._thread_projects[thread_ts] = project_dir
         self._save_state()
         return project_dir
@@ -138,6 +141,15 @@ class ClaudeHandler:
     def get_thread_project(self, thread_ts: str) -> str | None:
         """Get the project directory for a thread."""
         return self._thread_projects.get(thread_ts)
+
+    def set_thread_session(self, thread_ts: str, session_id: str) -> None:
+        """스레드에 기존 Claude CLI 세션을 연결한다 (다음 메시지부터 --resume)."""
+        self._sessions[thread_ts] = session_id
+        self._save_state()
+
+    def get_thread_session(self, thread_ts: str) -> str | None:
+        """스레드에 연결된 세션 ID를 반환한다."""
+        return self._sessions.get(thread_ts)
 
     @staticmethod
     def create_project(name: str) -> str:
@@ -169,6 +181,15 @@ class ClaudeHandler:
         self._thread_efforts[thread_ts] = effort
         self._save_state()
 
+    def get_permission_mode(self, thread_ts: str) -> str:
+        """Return the permission mode for a thread (falls back to global default)."""
+        return self._thread_perms.get(thread_ts, self._default_perm)
+
+    def set_thread_permission_mode(self, thread_ts: str, mode: str) -> None:
+        """Set the permission mode for a specific thread."""
+        self._thread_perms[thread_ts] = mode
+        self._save_state()
+
     def set_default_model(self, model: str) -> None:
         """Set the global default model (persisted)."""
         self._default_model = model
@@ -179,6 +200,11 @@ class ClaudeHandler:
         self._default_effort = effort
         self._save_state()
 
+    def set_default_permission_mode(self, mode: str) -> None:
+        """Set the global default permission mode (persisted)."""
+        self._default_perm = mode
+        self._save_state()
+
     @property
     def default_model(self) -> str:
         return self._default_model
@@ -187,6 +213,10 @@ class ClaudeHandler:
     def default_effort(self) -> str:
         return self._default_effort
 
+    @property
+    def default_permission_mode(self) -> str:
+        return self._default_perm
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -194,20 +224,24 @@ class ClaudeHandler:
     async def handle_thread_reply(
         self, channel: str, thread_ts: str, text: str,
         on_event: OnEventFn | None = None,
+        on_permission: OnPermissionFn | None = None,
     ) -> ClaudeResult:
         """Handle a threaded reply (resume existing session or fallback)."""
         session_id = self._sessions.get(thread_ts)
         project_dir = self._thread_projects.get(thread_ts)
         model = self.get_model(thread_ts)
         effort = self.get_effort(thread_ts)
+        perm = self.get_permission_mode(thread_ts)
 
         if session_id:
             logger.info("Resuming session %s for thread %s", session_id, thread_ts)
-            cmd = self._build_cmd(resume=session_id, model=model, effort=effort)
+            cmd = self._build_cmd(
+                resume=session_id, model=model, effort=effort, permission_mode=perm,
+            )
             result = await self._run_claude(
                 cmd, text, cwd=project_dir, on_event=on_event,
                 slack_channel=channel, slack_thread_ts=thread_ts,
-                thread_ts=thread_ts,
+                thread_ts=thread_ts, on_permission=on_permission,
             )
             result.requested_model = model
             return result
@@ -215,14 +249,23 @@ class ClaudeHandler:
         # Fallback: session lost (process restart) — use thread history as context.
         logger.info("No session for thread %s, falling back to thread history.", thread_ts)
         prompt = await self._build_thread_prompt(channel, thread_ts)
-        cmd = self._build_cmd(model=model, effort=effort)
+        cmd = self._build_cmd(
+            model=model, effort=effort, name=self._session_name(text),
+            permission_mode=perm,
+        )
         result = await self._run_claude(
             cmd, prompt, cwd=project_dir, on_event=on_event,
             slack_channel=channel, slack_thread_ts=thread_ts,
-            thread_ts=thread_ts,
+            thread_ts=thread_ts, on_permission=on_permission,
         )
         result.requested_model = model
         return result
+
+    @staticmethod
+    def _session_name(text: str) -> str:
+        """새 세션의 표시 이름 — 터미널 /resume 목록에서 Slack 세션을 알아보기 위함."""
+        snippet = " ".join(text.split())[:40]
+        return f"Slack: {snippet}" if snippet else "Slack thread"
 
     # ------------------------------------------------------------------
     # Internals
@@ -230,10 +273,11 @@ class ClaudeHandler:
 
     @staticmethod
     def _build_cmd(
-        session_id: str | None = None,
         resume: str | None = None,
         model: str = DEFAULT_MODEL,
         effort: str = DEFAULT_EFFORT,
+        name: str | None = None,
+        permission_mode: str = DEFAULT_PERMISSION_MODE,
     ) -> list[str]:
         project_root = str(Path(__file__).resolve().parent.parent)
         tools_mcp_path = str(Path(__file__).resolve().parent / "tools_mcp.py")
@@ -247,17 +291,26 @@ class ClaudeHandler:
         })
         cmd = [
             "claude", "-p",
-            "--dangerously-skip-permissions",
             "--verbose",
+            "--input-format", "stream-json",
             "--output-format", "stream-json",
             "--model", model,
             "--effort", effort,
             "--mcp-config", mcp_config,
         ]
-        if session_id:
-            cmd.extend(["--session-id", session_id])
+        if permission_mode == "bypassPermissions":
+            cmd.append("--dangerously-skip-permissions")
+        else:
+            # 승인이 필요한 작업은 stdio control 프로토콜(can_use_tool)로 전달받아
+            # Slack 승인 플로우로 처리한다.
+            cmd.extend([
+                "--permission-mode", permission_mode,
+                "--permission-prompt-tool", "stdio",
+            ])
         if resume:
             cmd.extend(["--resume", resume])
+        if name:
+            cmd.extend(["--name", name])
         return cmd
 
     async def cancel_thread(self, thread_ts: str) -> bool:
@@ -292,6 +345,7 @@ class ClaudeHandler:
         on_event: OnEventFn | None = None,
         slack_channel: str = "", slack_thread_ts: str = "",
         thread_ts: str = "",
+        on_permission: OnPermissionFn | None = None,
     ) -> ClaudeResult:
         """Spawn a ``claude -p`` subprocess and return the response text.
 
@@ -299,6 +353,10 @@ class ClaudeHandler:
         that long-running tasks (hours) are never killed as long as Claude is
         still producing output.  Only an *idle* timeout (no new output for
         the configured seconds) will terminate the process.
+
+        stdin is kept open (``--input-format stream-json``) so that
+        ``can_use_tool`` permission requests from the CLI can be answered
+        mid-run via *on_permission* — this powers the Slack approval flow.
 
         If *on_event* is provided, each parsed JSON event is forwarded to it
         so callers can post real-time progress to Slack.
@@ -328,14 +386,54 @@ class ClaudeHandler:
         if thread_ts:
             self._active_processes[thread_ts] = process
 
-        # Feed prompt and close stdin so Claude starts processing.
+        # Feed prompt as a stream-json user message; stdin stays open for
+        # control_response messages (permission approvals).
         assert process.stdin is not None
-        process.stdin.write(prompt.encode("utf-8"))
+        user_msg = json.dumps({
+            "type": "user",
+            "message": {"role": "user", "content": [{"type": "text", "text": prompt}]},
+        })
+        process.stdin.write(user_msg.encode("utf-8") + b"\n")
         await process.stdin.drain()
-        process.stdin.close()
+
+        stdin_lock = asyncio.Lock()
+        approval_tasks: set[asyncio.Task] = set()
+
+        async def _answer_permission_request(event: dict[str, Any]) -> None:
+            """can_use_tool 요청을 on_permission에 위임하고 control_response를 보낸다."""
+            request = event.get("request", {})
+            decision: dict[str, Any] = {
+                "behavior": "deny",
+                "message": "No approval handler configured.",
+            }
+            if on_permission is not None:
+                try:
+                    decision = await on_permission(request)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning("on_permission handler error: %s", exc)
+                    decision = {"behavior": "deny", "message": f"승인 처리 오류: {exc}"}
+            if decision.get("behavior") == "allow" and "updatedInput" not in decision:
+                decision["updatedInput"] = request.get("input", {})
+            payload = json.dumps({
+                "type": "control_response",
+                "response": {
+                    "subtype": "success",
+                    "request_id": event.get("request_id", ""),
+                    "response": decision,
+                },
+            })
+            try:
+                async with stdin_lock:
+                    process.stdin.write(payload.encode("utf-8") + b"\n")
+                    await process.stdin.drain()
+            except Exception as exc:
+                logger.warning("Failed to send control_response: %s", exc)
 
         # Stream stdout line-by-line with an idle timeout.
         lines: list[str] = []
+        result_seen = False
         assert process.stdout is not None
         try:
             while True:
@@ -359,38 +457,66 @@ class ClaudeHandler:
 
                 # Parse event and capture session ID.
                 stripped = line_str.strip()
-                if stripped:
+                if not stripped:
+                    continue
+                try:
+                    event = json.loads(stripped)
+                except json.JSONDecodeError:
+                    continue
+
+                # Permission request — answer asynchronously so the read
+                # loop keeps consuming events while the user decides.
+                if event.get("type") == "control_request":
+                    if event.get("request", {}).get("subtype") == "can_use_tool":
+                        task = asyncio.create_task(_answer_permission_request(event))
+                        approval_tasks.add(task)
+                        task.add_done_callback(approval_tasks.discard)
+                    continue
+
+                # Capture session_id from the init event.
+                if (
+                    thread_ts
+                    and event.get("type") == "system"
+                    and event.get("subtype") == "init"
+                    and event.get("session_id")
+                ):
+                    self._sessions[thread_ts] = event["session_id"]
+                    self._save_state()
+                    logger.info("Captured session %s for thread %s", event["session_id"], thread_ts)
+                if on_event:
                     try:
-                        event = json.loads(stripped)
-                    except json.JSONDecodeError:
-                        continue
-                    # Capture session_id from the init event.
-                    if (
-                        thread_ts
-                        and event.get("type") == "system"
-                        and event.get("subtype") == "init"
-                        and event.get("session_id")
-                    ):
-                        self._sessions[thread_ts] = event["session_id"]
-                        self._save_state()
-                        logger.info("Captured session %s for thread %s", event["session_id"], thread_ts)
-                    if on_event:
-                        try:
-                            await on_event(event)
-                        except Exception as exc:
-                            logger.debug("on_event error: %s", exc)
+                        await on_event(event)
+                    except Exception as exc:
+                        logger.debug("on_event error: %s", exc)
+
+                # stream-json 입력 모드에서는 result 후에도 프로세스가 다음
+                # 입력을 기다리므로, result를 받으면 턴을 종료시킨다.
+                if event.get("type") == "result":
+                    result_seen = True
+                    break
 
         except Exception:
             process.kill()
             await process.wait()
             raise
         finally:
+            for task in approval_tasks:
+                task.cancel()
             if thread_ts:
                 self._active_processes.pop(thread_ts, None)
 
-        await process.wait()
+        try:
+            process.stdin.close()
+        except Exception:
+            pass
+        try:
+            await asyncio.wait_for(process.wait(), timeout=15)
+        except asyncio.TimeoutError:
+            logger.warning("Claude subprocess did not exit after stdin close, killing.")
+            process.kill()
+            await process.wait()
 
-        if process.returncode != 0:
+        if not result_seen and process.returncode != 0:
             stderr_bytes = await process.stderr.read() if process.stderr else b""
             stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
             stdout_text = "".join(lines).strip()
@@ -448,6 +574,7 @@ class ClaudeHandler:
             cr.total_cost_usd = result_event.get("total_cost_usd", 0.0)
             cr.duration_ms = result_event.get("duration_ms", 0)
             cr.model_usage = result_event.get("modelUsage", {})
+            cr.permission_denials = result_event.get("permission_denials", []) or []
             usage = result_event.get("usage", {})
             cr.input_tokens = usage.get("input_tokens", 0)
             cr.output_tokens = usage.get("output_tokens", 0)

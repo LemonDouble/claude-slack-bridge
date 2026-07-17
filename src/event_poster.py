@@ -60,7 +60,9 @@ class EventPoster:
                 if not isinstance(block, dict):
                     continue
                 if block.get("type") == "tool_use":
-                    parts.append(_format_tool_use(block))
+                    line = _format_tool_use(block)
+                    if line:
+                        parts.append(line)
             return "\n".join(parts) if parts else None
 
         if etype == "system" and event.get("subtype") == "init":
@@ -115,7 +117,7 @@ def _format_model_name(model_id: str) -> str:
     return name.replace("-", " ").title()
 
 
-def _format_tool_use(block: dict[str, Any]) -> str:
+def _format_tool_use(block: dict[str, Any]) -> str | None:
     name = block.get("name", "unknown")
     inp = block.get("input", {})
 
@@ -139,6 +141,9 @@ def _format_tool_use(block: dict[str, Any]) -> str:
     if name in ("Agent", "agent"):
         desc = inp.get("description") or inp.get("prompt", "")[:60]
         return f":robot_face:  *Agent* {desc}"
+
+    if name == "AskUserQuestion":
+        return None  # 질문은 전용 버튼 메시지로 표시되므로 진행 로그에서 생략
 
     summary = str(inp)[:80]
     return f":hammer_and_wrench:  *{name}* {summary}"

@@ -17,16 +17,19 @@ class Config(BaseSettings):
     Required variables (must be set in the environment or a .env file):
       - SLACK_BOT_TOKEN: Bot OAuth token (xoxb-...)
       - SLACK_APP_TOKEN: App-level token for Socket Mode (xapp-...)
-      - SLACK_CHANNEL:   Channel name or ID where messages are posted (e.g. #general)
+
+    Optional:
+      - TIMEOUT_LIMIT_MINUTES: idle timeout for Claude subprocesses (default 720)
+      - PROJECTS_DIR: root directory of projects (used via constants.PROJECTS_ROOT)
     """
 
     slack_bot_token: str
     slack_app_token: str
-    slack_channel: str = ""  # Not used by daemon; overridden per-session
     timeout_limit_minutes: int = 720
-    projects_dir: str = "/home/lemon/claude-projects"
+    projects_dir: str = str(Path.home() / "claude-projects")
 
     model_config = {
         "env_file": str(Path(__file__).resolve().parent.parent / ".env"),
         "env_file_encoding": "utf-8",
+        "extra": "ignore",
     }

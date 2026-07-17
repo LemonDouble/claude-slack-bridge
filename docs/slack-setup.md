@@ -96,4 +96,4 @@ Slack → Claude 방향의 프로젝트 선택 UI(Block Kit 버튼, 모달)를 �
 |---|---|---|
 | `SLACK_BOT_TOKEN` | `xoxb-...` | `.env` |
 | `SLACK_APP_TOKEN` | `xapp-...` | `.env` |
-| `SLACK_CHANNEL` | `#채널이름` | MCP 설정 (프로젝트별) |
+| `PROJECTS_DIR` | 프로젝트 루트 절대 경로 | `.env` |
