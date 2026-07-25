@@ -24,15 +24,31 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from constants import STATE_FILE, PROJECTS_ROOT, DEFAULT_SETTINGS
+from constants import (
+    CLI_ENTRYPOINT,
+    DEFAULT_SETTINGS,
+    MAX_TRACKED_FILES,
+    MAX_TRACKED_THREADS,
+    MAX_TRACKED_TURNS,
+    PROJECTS_ROOT,
+    REWIND_TIMEOUT_SECONDS,
+    STATE_FILE,
+)
+from file_downloader import format_file_metadata
+from session_catalog import find_resume_point
 
-# 구버전 상태 파일의 설정별 개별 키 (마이그레이션용)
-_LEGACY_DEFAULT_KEYS = {
-    "model": "default_model", "effort": "default_effort", "perm": "default_permission_mode",
-}
-_LEGACY_THREAD_KEYS = {
-    "model": "thread_models", "effort": "thread_efforts", "perm": "thread_permission_modes",
-}
+# 파일 되돌리기 대상으로 표시할 도구 → 경로가 담긴 입력 키
+_EDIT_TOOLS = {"Edit": "file_path", "Write": "file_path", "NotebookEdit": "notebook_path"}
+
+
+def _edited_path(block: dict[str, Any]) -> str | None:
+    """tool_use 블록이 파일을 수정하는 도구면 그 경로를 반환한다."""
+    key = _EDIT_TOOLS.get(block.get("name", ""))
+    if not key:
+        return None
+    path = block.get("input", {}).get(key)
+    return path if isinstance(path, str) and path else None
+
 
 OnEventFn = Callable[[dict[str, Any]], Coroutine[Any, Any, None]]
 # 권한 요청(can_use_tool request dict)을 받아 결정을 반환하는 콜백.
@@ -64,7 +80,7 @@ class ClaudeHandler:
         slack_client: An async Slack WebClient (``self._app.client``).
     """
 
-    def __init__(self, slack_client: Any, idle_timeout_minutes: int = 720) -> None:
+    def __init__(self, slack_client: Any, idle_timeout_minutes: int) -> None:
         self._slack_client = slack_client
         self._bot_user_id: str = ""
         self._idle_timeout = idle_timeout_minutes * 60
@@ -75,6 +91,10 @@ class ClaudeHandler:
         self._thread_settings: dict[str, dict[str, str]] = {  # kind → {thread_ts → 값}
             kind: {} for kind in DEFAULT_SETTINGS
         }
+        # 되돌리기(rewind)용: thread_ts → 턴 기록 목록 (오래된 순).
+        self._turns: dict[str, list[dict[str, Any]]] = {}
+        # thread_ts → 다음 실행에 적용할 --resume-session-at 기준점.
+        self._pending_resume_at: dict[str, str] = {}
         self._load_state()
 
     async def initialize(self) -> str:
@@ -96,17 +116,11 @@ class ClaudeHandler:
             data = json.loads(STATE_FILE.read_text())
             self._thread_projects = data.get("thread_projects", {})
             self._sessions = data.get("sessions", {})
+            self._turns = data.get("turns", {})
+            self._pending_resume_at = data.get("pending_resume_at", {})
             for kind in DEFAULT_SETTINGS:
-                self._defaults[kind] = (
-                    data.get("defaults", {}).get(kind)
-                    or data.get(_LEGACY_DEFAULT_KEYS[kind])
-                    or DEFAULT_SETTINGS[kind]
-                )
-                self._thread_settings[kind] = (
-                    data.get("thread_settings", {}).get(kind)
-                    or data.get(_LEGACY_THREAD_KEYS[kind])
-                    or {}
-                )
+                self._defaults[kind] = data.get("defaults", {}).get(kind) or DEFAULT_SETTINGS[kind]
+                self._thread_settings[kind] = data.get("thread_settings", {}).get(kind) or {}
             logger.info(
                 "Restored state: %d threads, %d sessions, defaults=%s.",
                 len(self._thread_projects), len(self._sessions), self._defaults,
@@ -123,6 +137,8 @@ class ClaudeHandler:
                 "sessions": self._sessions,
                 "defaults": self._defaults,
                 "thread_settings": self._thread_settings,
+                "turns": self._turns,
+                "pending_resume_at": self._pending_resume_at,
             }))
         except Exception as exc:
             logger.warning("Failed to save state: %s", exc)
@@ -192,6 +208,7 @@ class ClaudeHandler:
         self, channel: str, thread_ts: str, text: str,
         on_event: OnEventFn | None = None,
         on_permission: OnPermissionFn | None = None,
+        message_ts: str = "",
     ) -> ClaudeResult:
         """Handle a threaded reply (resume existing session or fallback)."""
         session_id = self._sessions.get(thread_ts)
@@ -199,18 +216,35 @@ class ClaudeHandler:
         model = self.get_setting(thread_ts, "model")
         effort = self.get_setting(thread_ts, "effort")
         perm = self.get_setting(thread_ts, "perm")
+        if not session_id:
+            # 새 세션이 시작되면 이전 세션의 메시지 uuid는 모두 무효하다.
+            self._turns.pop(thread_ts, None)
+            self._pending_resume_at.pop(thread_ts, None)
+        turn = self._begin_turn(thread_ts, message_ts, text)
 
         if session_id:
-            logger.info("Resuming session %s for thread %s", session_id, thread_ts)
+            # 되돌리기가 예약돼 있으면 이번 실행에서 소비한다 (실패 시 복구).
+            resume_at = self._pending_resume_at.pop(thread_ts, None)
+            logger.info(
+                "Resuming session %s for thread %s (resume_at=%s)",
+                session_id, thread_ts, resume_at or "-",
+            )
             cmd = self._build_cmd(
                 resume=session_id, model=model, effort=effort, permission_mode=perm,
+                resume_at=resume_at,
             )
-            result = await self._run_claude(
-                cmd, text, cwd=project_dir, on_event=on_event,
-                slack_channel=channel, slack_thread_ts=thread_ts,
-                thread_ts=thread_ts, on_permission=on_permission,
-            )
+            try:
+                result = await self._run_claude(
+                    cmd, text, cwd=project_dir, on_event=on_event,
+                    slack_channel=channel, slack_thread_ts=thread_ts,
+                    thread_ts=thread_ts, on_permission=on_permission, turn=turn,
+                )
+            except Exception:
+                if resume_at:
+                    self._pending_resume_at[thread_ts] = resume_at
+                raise
             result.requested_model = model
+            self._save_state()
             return result
 
         # Fallback: session lost (process restart) — use thread history as context.
@@ -223,10 +257,130 @@ class ClaudeHandler:
         result = await self._run_claude(
             cmd, prompt, cwd=project_dir, on_event=on_event,
             slack_channel=channel, slack_thread_ts=thread_ts,
-            thread_ts=thread_ts, on_permission=on_permission,
+            thread_ts=thread_ts, on_permission=on_permission, turn=turn,
         )
         result.requested_model = model
+        self._save_state()
         return result
+
+    # ------------------------------------------------------------------
+    # Turn tracking + rewind
+    # ------------------------------------------------------------------
+
+    def _begin_turn(self, thread_ts: str, message_ts: str, text: str) -> dict[str, Any]:
+        """새 턴 기록을 만들어 스레드 기록에 추가하고 반환한다.
+
+        기록은 ``_run_claude``가 스트림을 읽으면서 채운다(메시지 uuid, 수정 파일).
+        되돌리기 시 Slack 메시지 ts로 어느 턴인지 역추적하는 데 쓰인다.
+        """
+        turns = self._turns.setdefault(thread_ts, [])
+        try:
+            slack_ts = float(message_ts or thread_ts)
+        except ValueError:
+            slack_ts = 0.0
+        turn: dict[str, Any] = {
+            "slack_ts": slack_ts,
+            "prev_uuid": turns[-1].get("last_assistant_uuid") if turns else None,
+            "user_uuid": None,
+            "last_assistant_uuid": None,
+            "text": " ".join(text.split())[:120],
+            "files": [],
+        }
+        turns.append(turn)
+        del turns[:-MAX_TRACKED_TURNS]
+        self._prune_turns(thread_ts)
+        return turn
+
+    def _prune_turns(self, keep: str) -> None:
+        """오래된 스레드의 턴 기록을 버린다 (상태 파일 크기 제한).
+
+        thread_ts는 고정폭 Slack 타임스탬프 문자열이라 사전순 = 시간순이다.
+        """
+        for thread_ts in sorted(self._turns)[:-MAX_TRACKED_THREADS]:
+            if thread_ts != keep:
+                del self._turns[thread_ts]
+
+    def find_turn(self, thread_ts: str, message_ts: str) -> dict[str, Any] | None:
+        """Slack 메시지 ts가 속한 턴을 찾는다.
+
+        어떤 메시지든(사용자 요청, 봇의 진행/응답 메시지) 그 턴이 시작된 이후에
+        게시되므로, ``slack_ts <= message_ts``인 마지막 턴이 해당 턴이다.
+        """
+        try:
+            target = float(message_ts)
+        except (TypeError, ValueError):
+            return None
+        match = None
+        for turn in self._turns.get(thread_ts, []):
+            if turn["slack_ts"] <= target:
+                match = turn
+            else:
+                break
+        return match
+
+    def resolve_resume_point(self, thread_ts: str, turn: dict[str, Any]) -> str | None:
+        """턴의 대화 되돌리기 기준점을 반환한다 (없으면 트랜스크립트에서 복원)."""
+        if turn.get("prev_uuid"):
+            return turn["prev_uuid"]
+        session_id = self._sessions.get(thread_ts)
+        project_dir = self._thread_projects.get(thread_ts)
+        user_uuid = turn.get("user_uuid")
+        if not (session_id and project_dir and user_uuid):
+            return None
+        found = find_resume_point(project_dir, session_id, user_uuid)
+        if found:
+            turn["prev_uuid"] = found
+            self._save_state()
+        return found
+
+    def rewind_conversation(self, thread_ts: str, turn: dict[str, Any], resume_at: str) -> None:
+        """대화를 *turn* 직전으로 되돌린다.
+
+        ``--resume-session-at``은 프롬프트와 함께여야 동작하므로 기준점만 예약해
+        두고, 다음 메시지를 보낼 때 적용한다. 취소된 턴 기록도 함께 버린다.
+        """
+        self._pending_resume_at[thread_ts] = resume_at
+        turns = self._turns.get(thread_ts, [])
+        if turn in turns:
+            del turns[turns.index(turn):]
+        self._save_state()
+
+    async def rewind_files(self, thread_ts: str, turn: dict[str, Any]) -> tuple[bool, str]:
+        """*turn* 시작 시점의 파일 상태로 되돌린다. (성공 여부, 메시지)를 반환."""
+        session_id = self._sessions.get(thread_ts)
+        project_dir = self._thread_projects.get(thread_ts)
+        user_uuid = turn.get("user_uuid")
+        if not session_id:
+            return False, "이 스레드에 연결된 세션이 없습니다."
+        if not user_uuid:
+            return False, "이 턴의 메시지 ID를 추적하지 못해 파일을 되돌릴 수 없습니다."
+
+        # --rewind-files는 프롬프트와 함께 쓸 수 없는 단독 동작이다.
+        cmd = ["claude", "-p", "--resume", session_id, "--rewind-files", user_uuid]
+        env = os.environ.copy()
+        env.pop("CLAUDECODE", None)
+        env["CLAUDE_CODE_ENTRYPOINT"] = CLI_ENTRYPOINT
+        env["CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING"] = "1"
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                env=env, cwd=project_dir,
+            )
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(), timeout=REWIND_TIMEOUT_SECONDS
+            )
+        except TimeoutError:
+            return False, "파일 되돌리기가 시간 내에 끝나지 않았습니다."
+        except FileNotFoundError:
+            return False, "Claude CLI를 찾을 수 없습니다."
+
+        out = (stdout or b"").decode("utf-8", errors="replace").strip()
+        err = (stderr or b"").decode("utf-8", errors="replace").strip()
+        if process.returncode != 0:
+            logger.warning("rewind-files failed (rc=%s): %s | %s", process.returncode, err, out)
+            return False, (err or out or "알 수 없는 오류")[:300]
+        logger.info("Rewound files for thread %s to %s: %s", thread_ts, user_uuid, out)
+        return True, out or "파일을 되돌렸습니다."
 
     @staticmethod
     def _session_name(text: str) -> str:
@@ -245,6 +399,7 @@ class ClaudeHandler:
         permission_mode: str,
         resume: str | None = None,
         name: str | None = None,
+        resume_at: str | None = None,
     ) -> list[str]:
         project_root = str(Path(__file__).resolve().parent.parent)
         tools_mcp_path = str(Path(__file__).resolve().parent / "tools_mcp.py")
@@ -261,6 +416,8 @@ class ClaudeHandler:
             "--verbose",
             "--input-format", "stream-json",
             "--output-format", "stream-json",
+            # 사용자 메시지를 uuid와 함께 되돌려받아 되돌리기 기준점으로 쓴다.
+            "--replay-user-messages",
             "--model", model,
             "--effort", effort,
             "--mcp-config", mcp_config,
@@ -276,6 +433,9 @@ class ClaudeHandler:
             ])
         if resume:
             cmd.extend(["--resume", resume])
+            # 지정한 assistant 메시지 이후의 대화를 잘라내고 이어간다 (rewind).
+            if resume_at:
+                cmd.extend(["--resume-session-at", resume_at])
         if name:
             cmd.extend(["--name", name])
         return cmd
@@ -304,7 +464,11 @@ class ClaudeHandler:
 
     def clear_session(self, thread_ts: str) -> None:
         """Remove the stored session ID so the next run starts fresh."""
-        if self._sessions.pop(thread_ts, None):
+        # 새 세션에서는 기존 턴 기록과 예약된 되돌리기가 모두 무의미하다.
+        removed = self._sessions.pop(thread_ts, None)
+        self._turns.pop(thread_ts, None)
+        self._pending_resume_at.pop(thread_ts, None)
+        if removed:
             self._save_state()
 
     async def _run_claude(
@@ -313,6 +477,7 @@ class ClaudeHandler:
         slack_channel: str = "", slack_thread_ts: str = "",
         thread_ts: str = "",
         on_permission: OnPermissionFn | None = None,
+        turn: dict[str, Any] | None = None,
     ) -> ClaudeResult:
         """Spawn a ``claude -p`` subprocess and return the response text.
 
@@ -330,6 +495,10 @@ class ClaudeHandler:
         """
         env = os.environ.copy()
         env.pop("CLAUDECODE", None)
+        # 터미널 /resume 목록에서 필터링되지 않도록 entrypoint를 명시하고,
+        # print 모드에서 기본 비활성인 파일 체크포인트를 켠다 (코드 되돌리기용).
+        env["CLAUDE_CODE_ENTRYPOINT"] = CLI_ENTRYPOINT
+        env["CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING"] = "1"
         if slack_channel:
             env["SLACK_CHANNEL"] = slack_channel
         if slack_thread_ts:
@@ -411,7 +580,7 @@ class ClaudeHandler:
                     line_bytes = await asyncio.wait_for(
                         process.stdout.readline(), timeout=self._idle_timeout
                     )
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     process.kill()
                     await process.wait()
                     logger.error(
@@ -451,10 +620,31 @@ class ClaudeHandler:
                     self._save_state()
                     logger.info("Captured session %s for thread %s", event["session_id"], thread_ts)
 
+                # 되돌리기용 턴 정보 수집. --replay-user-messages 덕분에 첫 user
+                # 이벤트가 이번 턴의 프롬프트이며, 그 uuid가 파일 되돌리기 기준점이다.
+                if turn is not None:
+                    if (
+                        event.get("type") == "user"
+                        and turn.get("user_uuid") is None
+                        and event.get("uuid")
+                    ):
+                        turn["user_uuid"] = event["uuid"]
+                    elif event.get("type") == "assistant" and event.get("uuid"):
+                        turn["last_assistant_uuid"] = event["uuid"]
+
                 if event.get("type") == "assistant":
                     for block in event.get("message", {}).get("content", []):
-                        if isinstance(block, dict) and block.get("type") == "text":
+                        if not isinstance(block, dict):
+                            continue
+                        if block.get("type") == "text":
                             text_parts.append(block["text"])
+                        elif turn is not None and block.get("type") == "tool_use":
+                            path = _edited_path(block)
+                            if (
+                                path and path not in turn["files"]
+                                and len(turn["files"]) < MAX_TRACKED_FILES
+                            ):
+                                turn["files"].append(path)
 
                 if on_event:
                     try:
@@ -484,7 +674,7 @@ class ClaudeHandler:
             pass
         try:
             await asyncio.wait_for(process.wait(), timeout=15)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.warning("Claude subprocess did not exit after stdin close, killing.")
             process.kill()
             await process.wait()
@@ -525,8 +715,6 @@ class ClaudeHandler:
 
     async def _build_thread_prompt(self, channel: str, thread_ts: str) -> str:
         """Fetch Slack thread history and format as a conversation prompt."""
-        from file_downloader import format_file_metadata
-
         resp = await self._slack_client.conversations_replies(
             channel=channel, ts=thread_ts
         )
