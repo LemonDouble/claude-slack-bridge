@@ -12,6 +12,7 @@ import json
 import logging
 import re
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -74,6 +75,41 @@ def _session_file(project_dir: str, session_id: str) -> Path:
     return CLAUDE_PROJECTS_DIR / encode_project_path(project_dir) / f"{session_id}.jsonl"
 
 
+def _index_nodes(session_file: Path) -> dict[str, tuple[str, str | None, str]]:
+    """uuid → (type, parentUuid, timestamp) 인덱스.
+
+    부모 체인은 system/attachment 같은 중간 엔트리를 거쳐 가므로, uuid를 가진
+    엔트리를 **전부** 넣어야 한다. 대화 메시지만 넣으면 추적이 끊긴다.
+    """
+    nodes: dict[str, tuple[str, str | None, str]] = {}
+    with session_file.open(encoding="utf-8", errors="replace") as fp:
+        for line in fp:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if uuid := event.get("uuid"):
+                nodes[uuid] = (
+                    event.get("type") or "", event.get("parentUuid"), event.get("timestamp", ""),
+                )
+    return nodes
+
+
+def _ancestors(
+    nodes: dict[str, tuple[str, str | None, str]], start: str,
+) -> Iterator[str]:
+    """*start*에서 parentUuid를 따라 root까지 거슬러 올라간다 (start 포함)."""
+    seen: set[str] = set()
+    cursor: str | None = start
+    while cursor and cursor in nodes and cursor not in seen:
+        seen.add(cursor)
+        yield cursor
+        cursor = nodes[cursor][1]
+
+
 def _active_chain(
     nodes: dict[str, tuple[str, str | None, str]], leaves: set[str],
 ) -> list[str]:
@@ -81,24 +117,12 @@ def _active_chain(
 
     되돌리기(rewind)를 하면 한 세션 파일 안에 버려진 분기가 함께 남는다.
     CLI가 resume할 때 고르는 것과 같은 기준(타임스탬프가 가장 늦은 메시지)을
-    leaf로 잡고 parentUuid를 거슬러 올라가, 실제로 이어질 대화만 추린다.
-
-    *nodes*에는 uuid를 가진 모든 엔트리가 들어 있어야 한다. 부모 체인이
-    attachment 같은 중간 엔트리를 거쳐 가므로, 이들을 빼면 추적이 끊긴다.
-    *leaves*는 leaf 후보(대화 메시지)의 uuid 집합이다.
+    leaf로 잡고 거슬러 올라가, 실제로 이어질 대화만 추린다.
     """
     if not leaves:
         return []
     leaf = max(leaves, key=lambda u: nodes[u][2])
-    chain: list[str] = []
-    seen: set[str] = set()
-    cursor: str | None = leaf
-    while cursor and cursor in nodes and cursor not in seen:
-        seen.add(cursor)
-        chain.append(cursor)
-        cursor = nodes[cursor][1]
-    chain.reverse()
-    return chain
+    return list(_ancestors(nodes, leaf))[::-1]
 
 
 def build_recap(
@@ -211,36 +235,12 @@ def find_resume_point(project_dir: str, session_id: str, user_uuid: str) -> str 
     session_file = _session_file(project_dir, session_id)
     if not session_file.is_file():
         return None
-
-    # uuid → (type, parentUuid) 인덱스만 만든다 (전체 메시지를 들고 있지 않기 위함).
-    parents: dict[str, tuple[str, str | None]] = {}
-    with session_file.open(encoding="utf-8", errors="replace") as fp:
-        for line in fp:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            uuid = event.get("uuid")
-            if uuid and event.get("type") in ("user", "assistant"):
-                parents[uuid] = (event["type"], event.get("parentUuid"))
-
-    node = parents.get(user_uuid)
-    seen: set[str] = {user_uuid}
-    while node:
-        _etype, parent_uuid = node
-        if not parent_uuid or parent_uuid in seen:
-            return None
-        seen.add(parent_uuid)
-        parent = parents.get(parent_uuid)
-        if parent is None:
-            return None
-        if parent[0] == "assistant":
-            return parent_uuid
-        node = parent
-    return None
+    nodes = _index_nodes(session_file)
+    # start(user_uuid) 자신은 assistant가 아니므로 자연히 걸러진다.
+    return next(
+        (uuid for uuid in _ancestors(nodes, user_uuid) if nodes[uuid][0] == "assistant"),
+        None,
+    )
 
 
 def format_age(mtime: float) -> str:
