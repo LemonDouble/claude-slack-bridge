@@ -41,13 +41,12 @@ from session_catalog import find_resume_point
 _EDIT_TOOLS = {"Edit": "file_path", "Write": "file_path", "NotebookEdit": "notebook_path"}
 
 
-def _edited_path(block: dict[str, Any]) -> str | None:
-    """tool_use 블록이 파일을 수정하는 도구면 그 경로를 반환한다."""
-    key = _EDIT_TOOLS.get(block.get("name", ""))
-    if not key:
-        return None
-    path = block.get("input", {}).get(key)
-    return path if isinstance(path, str) and path else None
+def _to_ts(value: str) -> float:
+    """Slack 타임스탬프 문자열 → float (형식이 아니면 0.0)."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 OnEventFn = Callable[[dict[str, Any]], Coroutine[Any, Any, None]]
@@ -223,8 +222,7 @@ class ClaudeHandler:
         turn = self._begin_turn(thread_ts, message_ts, text)
 
         if session_id:
-            # 되돌리기가 예약돼 있으면 이번 실행에서 소비한다 (실패 시 복구).
-            resume_at = self._pending_resume_at.pop(thread_ts, None)
+            resume_at = self._pending_resume_at.get(thread_ts)
             logger.info(
                 "Resuming session %s for thread %s (resume_at=%s)",
                 session_id, thread_ts, resume_at or "-",
@@ -233,16 +231,13 @@ class ClaudeHandler:
                 resume=session_id, model=model, effort=effort, permission_mode=perm,
                 resume_at=resume_at,
             )
-            try:
-                result = await self._run_claude(
-                    cmd, text, cwd=project_dir, on_event=on_event,
-                    slack_channel=channel, slack_thread_ts=thread_ts,
-                    thread_ts=thread_ts, on_permission=on_permission, turn=turn,
-                )
-            except Exception:
-                if resume_at:
-                    self._pending_resume_at[thread_ts] = resume_at
-                raise
+            result = await self._run_claude(
+                cmd, text, cwd=project_dir, on_event=on_event,
+                slack_channel=channel, slack_thread_ts=thread_ts,
+                thread_ts=thread_ts, on_permission=on_permission, turn=turn,
+            )
+            # 실행이 끝난 뒤에 소비한다 — 도중에 실패하면 예약을 남겨 다시 시도한다.
+            self._pending_resume_at.pop(thread_ts, None)
             result.requested_model = model
             self._save_state()
             return result
@@ -274,12 +269,8 @@ class ClaudeHandler:
         되돌리기 시 Slack 메시지 ts로 어느 턴인지 역추적하는 데 쓰인다.
         """
         turns = self._turns.setdefault(thread_ts, [])
-        try:
-            slack_ts = float(message_ts or thread_ts)
-        except ValueError:
-            slack_ts = 0.0
         turn: dict[str, Any] = {
-            "slack_ts": slack_ts,
+            "slack_ts": _to_ts(message_ts or thread_ts),
             "prev_uuid": turns[-1].get("last_assistant_uuid") if turns else None,
             "user_uuid": None,
             "last_assistant_uuid": None,
@@ -306,10 +297,7 @@ class ClaudeHandler:
         어떤 메시지든(사용자 요청, 봇의 진행/응답 메시지) 그 턴이 시작된 이후에
         게시되므로, ``slack_ts <= message_ts``인 마지막 턴이 해당 턴이다.
         """
-        try:
-            target = float(message_ts)
-        except (TypeError, ValueError):
-            return None
+        target = _to_ts(message_ts)
         match = None
         for turn in self._turns.get(thread_ts, []):
             if turn["slack_ts"] <= target:
@@ -639,9 +627,11 @@ class ClaudeHandler:
                         if block.get("type") == "text":
                             text_parts.append(block["text"])
                         elif turn is not None and block.get("type") == "tool_use":
-                            path = _edited_path(block)
+                            key = _EDIT_TOOLS.get(block.get("name", ""))
+                            path = block.get("input", {}).get(key) if key else None
                             if (
-                                path and path not in turn["files"]
+                                isinstance(path, str) and path
+                                and path not in turn["files"]
                                 and len(turn["files"]) < MAX_TRACKED_FILES
                             ):
                                 turn["files"].append(path)

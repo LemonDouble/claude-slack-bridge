@@ -51,11 +51,9 @@ async def notify_on_slack(message: str) -> str:
     if not channel:
         return "오류: SLACK_CHANNEL 환경변수가 설정되지 않았습니다."
 
-    kwargs: dict = dict(channel=channel, text=message, mrkdwn=True)
-    if thread_ts:
-        kwargs["thread_ts"] = thread_ts
-
-    await client.chat_postMessage(**kwargs)
+    await client.chat_postMessage(
+        channel=channel, text=message, mrkdwn=True, thread_ts=thread_ts or None,
+    )
     logger.info("Notification posted to %s (thread: %s)", channel, thread_ts)
     return "알림이 전송되었습니다."
 
@@ -87,17 +85,10 @@ async def upload_to_slack(file_path: str, message: str = "") -> str:
         return result
     path = result
 
-    kwargs: dict = dict(
-        channel=channel,
-        file=str(path),
-        filename=path.name,
-        title=path.name,
-        initial_comment=message,
+    await client.files_upload_v2(
+        channel=channel, file=str(path), filename=path.name, title=path.name,
+        initial_comment=message, thread_ts=thread_ts or None,
     )
-    if thread_ts:
-        kwargs["thread_ts"] = thread_ts
-
-    await client.files_upload_v2(**kwargs)
     logger.info("File uploaded: %s", file_path)
     return f"파일이 업로드되었습니다: {path.name}"
 

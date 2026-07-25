@@ -591,10 +591,16 @@ class SlackDaemon:
             ))
             return
 
+        if files:
+            shown = ", ".join(f"`{Path(f).name}`" for f in files[:_REWIND_FILES_SHOWN])
+            extra = len(files) - _REWIND_FILES_SHOWN
+            targets = shown + (f" 외 {extra}개" if extra > 0 else "")
+        else:
+            targets = "_이 턴에서 수정된 파일 없음_"
         lines = [
             ":rewind: *이 지점으로 되돌립니다*",
             f"> _{turn.get('text') or '(내용 없음)'}_",
-            f"> 복구 대상: {self._describe_files(files)}",
+            f"> 복구 대상: {targets}",
         ]
         if not can_conv:
             lines.append("> :warning: 이 턴은 되돌릴 기준점이 없어 대화는 되돌릴 수 없습니다.")
@@ -606,15 +612,6 @@ class SlackDaemon:
             channel, thread_ts, text,
             blocks.rewind_blocks(text, value, can_conv, bool(files)),
         )
-
-    @staticmethod
-    def _describe_files(files: list[str]) -> str:
-        """되돌리기 안내에 쓸 파일 목록 요약."""
-        if not files:
-            return "_이 턴에서 수정된 파일 없음_"
-        shown = ", ".join(f"`{Path(f).name}`" for f in files[:_REWIND_FILES_SHOWN])
-        extra = len(files) - _REWIND_FILES_SHOWN
-        return f"{shown} 외 {extra}개" if extra > 0 else shown
 
     async def _handle_rewind_choice(self, ack: Any, body: dict[str, Any]) -> None:
         """되돌리기 범위 버튼 클릭 — 선택한 범위대로 실행한다."""
