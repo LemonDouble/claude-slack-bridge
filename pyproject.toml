@@ -8,5 +8,12 @@ dependencies = [
     "fastmcp>=3.2.0",
     "pydantic-settings>=2.13.1",
     "python-dotenv>=1.0.0",
-    "slack-bolt[async]>=1.27.0",
+    # 1.30부터 async는 본체에 포함 — [async] extra는 존재하지 않는다
+    "slack-bolt>=1.27.0",
 ]
+
+[dependency-groups]
+dev = ["pytest>=8.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

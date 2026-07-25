@@ -259,9 +259,23 @@ claude-slack-bridge/
 │   └── log_setup.py        # 공통 로깅 설정
 ├── docs/
 │   └── slack-setup.md      # Slack 앱 생성 가이드
+├── tests/
+│   └── test_bridge.py      # 깨지기 쉬운 지점만 확인하는 최소 테스트
 ├── pyproject.toml
 └── uv.lock
 ```
+
+---
+
+## 테스트
+
+```bash
+uv run pytest
+```
+
+깨지기 쉬운 네 곳만 확인합니다 — 트랜스크립트 부모 체인 추적과 되돌리기 분기 처리, Slack 메시지 → 되돌릴 턴 매핑, 완료 알림이 새 메시지 + 멘션으로 나가는지, 그리고 **`--help`에 없는 CLI 플래그가 아직 살아 있는지**.
+
+마지막 항목이 이 테스트를 두는 주된 이유입니다. 되돌리기와 승인 플로우는 `--resume-session-at`, `--rewind-files`, `--replay-user-messages`, `--permission-prompt-tool` 같은 숨은 플래그에 기대고 있어서, Claude CLI 업데이트로 사라지면 조용히 깨집니다. 세션 ID를 일부러 틀리게 줘서 인자 파싱만 통과시키므로 모델 호출도 비용도 없습니다. `claude`가 PATH에 없으면 자동으로 건너뜁니다.
 
 ---
 
