@@ -6,13 +6,14 @@ EventPoster는 Claude CLI의 실시간 이벤트를 수집하고, Slack rate lim
 """
 
 import logging
-import re
 import time
+from collections import deque
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
 _POST_INTERVAL = 3.0
+_VISIBLE_LINES = 30  # 진행 메시지에 유지할 최근 줄 수
 
 
 class EventPoster:
@@ -27,7 +28,8 @@ class EventPoster:
         self._channel = channel
         self._thread_ts = thread_ts
         self._progress_ts: str | None = None
-        self._lines: list[str] = []
+        # 몇 시간짜리 작업에서도 메모리가 늘지 않도록 최근 줄만 들고 있는다.
+        self._lines: deque[str] = deque(maxlen=_VISIBLE_LINES)
         self._last_post: float = 0.0
         self._dirty = False
 
@@ -72,8 +74,7 @@ class EventPoster:
         return None
 
     async def _post_or_update(self) -> None:
-        visible = self._lines[-30:]
-        text = "\n".join(visible)
+        text = "\n".join(self._lines)
         if not text:
             return
 
@@ -92,29 +93,6 @@ class EventPoster:
 
         self._last_post = time.monotonic()
         self._dirty = False
-
-
-def get_model_label(requested: str, model_usage: dict[str, Any]) -> str:
-    """Return a display label using the requested model name."""
-    for model_id in model_usage:
-        if requested and requested in model_id:
-            return _format_model_name(model_id)
-    return requested.capitalize() if requested else "Unknown"
-
-
-def _format_model_name(model_id: str) -> str:
-    """Convert a model ID like 'claude-opus-4-6' to 'Opus 4.6'."""
-    name = model_id.removeprefix("claude-")
-    name = re.sub(r"-\d{8,}$", "", name)
-    parts = name.split("-")
-    if len(parts) >= 3 and parts[-2].isdigit() and parts[-1].isdigit():
-        family = " ".join(p.capitalize() for p in parts[:-2])
-        version = f"{parts[-2]}.{parts[-1]}"
-        return f"{family} {version}"
-    if len(parts) >= 2 and parts[-1].isdigit():
-        family = " ".join(p.capitalize() for p in parts[:-1])
-        return f"{family} {parts[-1]}"
-    return name.replace("-", " ").title()
 
 
 def _format_tool_use(block: dict[str, Any]) -> str | None:

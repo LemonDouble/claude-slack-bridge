@@ -1,16 +1,13 @@
 """constants.py — 공유 상수.
 
-.env를 여기서 로드해 모든 모듈(데몬, tools_mcp)이 동일한 환경을 보게 한다.
+환경 변수에서 오는 값은 ``config``(pydantic-settings)가 읽고 검증한다.
 """
 
-import os
 from pathlib import Path
 
-from dotenv import load_dotenv
+from config import config
 
-load_dotenv(Path(__file__).resolve().parent.parent / ".env")
-
-PROJECTS_ROOT = Path(os.environ.get("PROJECTS_DIR", str(Path.home() / "claude-projects")))
+PROJECTS_ROOT = config.projects_dir
 CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
 
 # Claude CLI가 세션에 기록하는 entrypoint. 기본값(sdk-cli)은 터미널 /resume

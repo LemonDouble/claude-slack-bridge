@@ -8,30 +8,17 @@ stdout에는 INFO 이상, error.log에는 ERROR 이상 기록.
 import logging
 from pathlib import Path
 
-_configured = False
-
+_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 ERROR_LOG_PATH = Path(__file__).resolve().parent.parent / "error.log"
 
 
 def setup_logging() -> None:
-    global _configured
-    if _configured:
-        return
-    _configured = True
-
     root = logging.getLogger()
-    root.setLevel(logging.DEBUG)
+    if root.handlers:  # 이미 설정됨 (basicConfig와 동일한 판정)
+        return
+    logging.basicConfig(level=logging.INFO, format=_FORMAT)
 
-    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-
-    # stdout handler — INFO 이상
-    stream_handler = logging.StreamHandler()
-    stream_handler.setLevel(logging.INFO)
-    stream_handler.setFormatter(fmt)
-    root.addHandler(stream_handler)
-
-    # error.log handler — ERROR 이상
-    file_handler = logging.FileHandler(ERROR_LOG_PATH, encoding="utf-8")
-    file_handler.setLevel(logging.ERROR)
-    file_handler.setFormatter(fmt)
-    root.addHandler(file_handler)
+    errors = logging.FileHandler(ERROR_LOG_PATH, encoding="utf-8")
+    errors.setLevel(logging.ERROR)
+    errors.setFormatter(logging.Formatter(_FORMAT))
+    root.addHandler(errors)

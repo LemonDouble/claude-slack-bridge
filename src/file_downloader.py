@@ -8,6 +8,7 @@ import logging
 from pathlib import Path
 
 import aiohttp
+from slack_sdk.web.async_client import AsyncWebClient
 
 from constants import PROJECTS_ROOT
 
@@ -57,14 +58,17 @@ def format_file_metadata(files: list[dict]) -> str:
 
 async def download_file_by_id(
     file_id: str,
-    bot_token: str,
+    client: AsyncWebClient,
     dest_dir: Path,
 ) -> Path:
     """Slack file_id로 파일을 다운로드합니다.
 
+    파일 정보 조회는 slack_sdk가, 실제 내려받기는 aiohttp가 담당합니다
+    (url_private는 Web API가 아니라 인증 헤더가 붙은 일반 GET입니다).
+
     Args:
         file_id: Slack 파일 ID (``F...``).
-        bot_token: Slack Bot OAuth 토큰.
+        client: 인증된 Slack AsyncWebClient.
         dest_dir: 파일을 저장할 디렉토리.
 
     Returns:
@@ -73,39 +77,26 @@ async def download_file_by_id(
     Raises:
         RuntimeError: 다운로드 실패 시.
     """
-    headers = {"Authorization": f"Bearer {bot_token}"}
+    file_info = (await client.files_info(file=file_id))["file"]
+    url = file_info.get("url_private_download") or file_info.get("url_private")
+    if not url:
+        raise RuntimeError(f"파일 다운로드 URL을 찾을 수 없습니다: {file_id}")
 
-    async with aiohttp.ClientSession(headers=headers) as session:
-        # 1. files.info로 파일 정보 조회
-        async with session.get(
-            "https://slack.com/api/files.info",
-            params={"file": file_id},
-        ) as resp:
-            data = await resp.json()
-            if not data.get("ok"):
-                raise RuntimeError(f"Slack files.info 실패: {data.get('error', 'unknown')}")
+    filename = file_info.get("name", "unknown_file")
+    download_dir = dest_dir / DOWNLOADS_DIR_NAME
+    download_dir.mkdir(parents=True, exist_ok=True)
+    dest = download_dir / f"{file_id}_{filename}"
 
-        file_info = data["file"]
-        url = file_info.get("url_private_download") or file_info.get("url_private")
-        if not url:
-            raise RuntimeError(f"파일 다운로드 URL을 찾을 수 없습니다: {file_id}")
-
-        filename = file_info.get("name", "unknown_file")
-        safe_name = f"{file_id}_{filename}"
-        download_dir = dest_dir / DOWNLOADS_DIR_NAME
-        download_dir.mkdir(parents=True, exist_ok=True)
-        dest = download_dir / safe_name
-
-        # 이미 다운로드된 파일이면 바로 반환
-        if dest.exists():
-            logger.info("이미 다운로드됨: %s", dest)
-            return dest
-
-        # 2. 파일 다운로드
-        async with session.get(url) as resp:
-            if resp.status != 200:
-                raise RuntimeError(f"파일 다운로드 실패 (HTTP {resp.status}): {filename}")
-            dest.write_bytes(await resp.read())
-
-        logger.info("파일 다운로드 완료: %s → %s", filename, dest)
+    # 이미 다운로드된 파일이면 바로 반환
+    if dest.exists():
+        logger.info("이미 다운로드됨: %s", dest)
         return dest
+
+    headers = {"Authorization": f"Bearer {client.token}"}
+    async with aiohttp.ClientSession(headers=headers) as session, session.get(url) as resp:
+        if resp.status != 200:
+            raise RuntimeError(f"파일 다운로드 실패 (HTTP {resp.status}): {filename}")
+        dest.write_bytes(await resp.read())
+
+    logger.info("파일 다운로드 완료: %s → %s", filename, dest)
+    return dest

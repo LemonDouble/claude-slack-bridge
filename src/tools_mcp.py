@@ -13,12 +13,10 @@ import logging
 import os
 from pathlib import Path
 
-from dotenv import load_dotenv
-load_dotenv(Path(__file__).resolve().parent.parent / ".env")
-
 from fastmcp import FastMCP
 from slack_sdk.web.async_client import AsyncWebClient
 
+from config import config
 from file_downloader import download_file_by_id, validate_upload_path
 from log_setup import setup_logging
 
@@ -26,15 +24,8 @@ setup_logging()
 logger = logging.getLogger(__name__)
 
 mcp = FastMCP(name="SlackTools")
-_client: AsyncWebClient | None = None
-
-
-def _get_client() -> AsyncWebClient:
-    global _client
-    if _client is None:
-        token = os.environ.get("SLACK_BOT_TOKEN", "")
-        _client = AsyncWebClient(token=token)
-    return _client
+# 채널/스레드는 데몬이 spawn 시 주입하는 실행 컨텍스트라 호출 시점에 읽는다.
+client = AsyncWebClient(token=config.slack_bot_token)
 
 
 @mcp.tool()
@@ -60,14 +51,13 @@ async def notify_on_slack(message: str) -> str:
     if not channel:
         return "오류: SLACK_CHANNEL 환경변수가 설정되지 않았습니다."
 
-    client = _get_client()
     kwargs: dict = dict(channel=channel, text=message, mrkdwn=True)
     if thread_ts:
         kwargs["thread_ts"] = thread_ts
 
     await client.chat_postMessage(**kwargs)
     logger.info("Notification posted to %s (thread: %s)", channel, thread_ts)
-    return f"알림이 전송되었습니다."
+    return "알림이 전송되었습니다."
 
 
 @mcp.tool()
@@ -97,7 +87,6 @@ async def upload_to_slack(file_path: str, message: str = "") -> str:
         return result
     path = result
 
-    client = _get_client()
     kwargs: dict = dict(
         channel=channel,
         file=str(path),
@@ -132,11 +121,10 @@ async def download_slack_file(file_id: str) -> str:
         다운로드된 파일의 절대 경로, 또는 에러 메시지.
     """
     logger.info("download_slack_file called: file_id=%s", file_id)
-    client = _get_client()
     try:
         path = await download_file_by_id(
             file_id=file_id,
-            bot_token=client.token,
+            client=client,
             dest_dir=Path.cwd(),
         )
         return str(path)
